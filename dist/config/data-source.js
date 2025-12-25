@@ -50,6 +50,6 @@ exports.AppDataSource = new typeorm_1.DataSource({
     synchronize: false,
     logging: process.env.NODE_ENV !== 'production',
     entities: [User_1.User, Withdrawal_1.Withdrawal, Game_1.Game],
-    migrations: ['src/migrations/*.ts'],
+    migrations: ['dist/migrations/*.js'], // <- путь к скомпилированным JS
     subscribers: [],
 });

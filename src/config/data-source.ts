@@ -16,6 +16,6 @@ export const AppDataSource = new DataSource({
     synchronize: false,
     logging: process.env.NODE_ENV !== 'production',
     entities: [User, Withdrawal, Game],
-    migrations: ['src/migrations/*.ts'],
+    migrations: ['dist/migrations/*.js'], // <- путь к скомпилированным JS
     subscribers: [],
 });
