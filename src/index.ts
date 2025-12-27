@@ -35,7 +35,7 @@ class StarBot {
                 { command: 'games', description: '🎮 Все игры' },
                 { command: 'balance', description: '💰 Мой баланс' },
                 { command: 'withdraw', description: '💳 Вывод средств' }, // ← Добавлено
-                { command: 'referral', description: '👥 Рефералы' },
+                { command: 'referral', description: '👥 Звёзды за друзей' },
                 { command: 'help', description: '❓ Помощь' }
             ];
 
@@ -698,54 +698,65 @@ class StarBot {
             const isSubscribed = await this.checkAllSubscriptions(userId);
 
             if (isSubscribed) {
+                // Проверяем, не получал ли уже бонус
+                if (user.completedInitialSetup) {
+                    await ctx.answerCbQuery('✅ Вы уже завершили регистрацию');
+                    await this.showMainMenu(ctx);
+                    return;
+                }
+
                 user.subscribedToChannels = true;
+                user.completedInitialSetup = true;
+                user.stars += 10;
+                user.totalEarned += 10;
+
+                // Реферальный бонус
+                if (user.referrerId) {
+                    const referrer = await AppDataSource.getRepository(User).findOne({
+                        where: { telegramId: user.referrerId }
+                    });
+
+                    if (referrer) {
+                        referrer.stars += 3;
+                        referrer.referralsCount = (referrer.referralsCount || 0) + 1;
+                        await AppDataSource.getRepository(User).save(referrer);
+
+                        await ctx.telegram.sendMessage(
+                            referrer.telegramId,
+                            `🎉 По вашей ссылке зарегистрировался новый пользователь! Вам начислено +3 звезды!`
+                        );
+                    }
+                }
+
                 await AppDataSource.getRepository(User).save(user);
 
-                // Показываем выбор эмодзи
-                await this.showEmojiSelection(ctx);
-            } else {
-                await ctx.reply('❌ Вы не подписались на все каналы. Пожалуйста, подпишитесь и нажмите кнопку проверки снова.');
-            }
-        });
-
-        this.bot.action(/^select_emoji_(.+)$/, async (ctx) => {
-            const emoji = ctx.match[1];
-            const user = ctx.user!;
-
-            user.selectedEmoji = emoji;
-            user.completedInitialSetup = true;
-            user.stars += 10;
-
-            // Если есть реферер, начисляем ему 5 звезд
-            if (user.referrerId) {
-                const referrer = await AppDataSource.getRepository(User).findOne({
-                    where: { telegramId: user.referrerId }
-                });
-
-                if (referrer) {
-                    referrer.stars += 3;
-                    referrer.referralsCount += 1;
-                    referrer.referralLinks = [...(referrer.referralLinks || []), `https://t.me/${ctx.botInfo.username}?start=${referrer.telegramId}`];
-                    await AppDataSource.getRepository(User).save(referrer);
-
-                    await ctx.telegram.sendMessage(
-                        referrer.telegramId,
-                        `🎉 По вашей ссылке зарегистрировался новый пользователь! Вам начислено +3 звезды!`
-                    );
+                // Удаляем сообщение с кнопками подписки
+                try {
+                    if (ctx.callbackQuery?.message) {
+                        await ctx.deleteMessage();
+                    }
+                } catch (error) {
+                    console.log('⚠️ Не удалось удалить сообщение');
                 }
+
+                // Приветственное сообщение
+                await ctx.reply(
+                    `🎉 *Регистрация завершена!*\n\n` +
+                    `✅ Вы успешно подписались на каналы\n` +
+                    `💰 Начислено: 10 звезд\n` +
+                    `📊 Баланс: ${user.stars} ⭐\n\n` +
+                    `🎮 Теперь вы можете играть и зарабатывать!`,
+                    { parse_mode: 'Markdown' }
+                );
+
+                await this.showMainMenu(ctx);
+            } else {
+                await ctx.answerCbQuery('❌ Вы не подписались на все каналы');
             }
-
-            await AppDataSource.getRepository(User).save(user);
-
-            await ctx.editMessageText(
-                `🎉 Отлично! Вы выбрали эмодзи ${emoji}\n\n` +
-                `💰 Вам начислено 10 звезд за регистрацию!\n` +
-                `📊 Ваш баланс: ${user.stars} звезд`
-            );
-
-            await this.showMainMenu(ctx);
         });
 
+
+        
         // 5. Админ панель
         this.bot.command('admin', async (ctx) => {
             if (ctx.from.id === this.adminId) {
@@ -859,7 +870,7 @@ class StarBot {
                 `/help - Эта справка\n\n` +
                 `*Кнопки в меню:*\n` +
                 `🎮 Играть - Открыть список игр\n` +
-                `👥 Рефералы - Пригласить друзей\n` +
+                `👥 Звёзды за друзей - Пригласить друзей\n` +
                 `💰 Вывод средств - Вывести заработанное\n` +
                 `❓ Помощь - Эта справка\n` +
                 `═══════════════════\n` +
@@ -1010,7 +1021,7 @@ class StarBot {
             buttons.push([urlButton]);
         }
 
-        // Отдельная строка для кнопки проверки
+        // Кнопка проверки
         const checkButton = Markup.button.callback(
             '✅ Я подписался на все каналы',
             `check_subscription_${ctx.from!.id}`
@@ -1019,7 +1030,8 @@ class StarBot {
 
         await ctx.reply(
             '🎯 Добро пожаловать! Для начала работы необходимо подписаться на наши каналы:\n\n' +
-            channels.map(c => `• ${c}`).join('\n'),
+            channels.map(c => `• ${c}`).join('\n') + '\n\n' +
+            'После подписки нажмите кнопку проверки ⬇️',
             Markup.inlineKeyboard(buttons)
         );
     }
@@ -1041,22 +1053,7 @@ class StarBot {
         }
     }
 
-    private async showEmojiSelection(ctx: BotContext) {
-        const buttons = [];
-        const emojiPerRow = 3;
-
-        for (let i = 0; i < this.emojis.length; i += emojiPerRow) {
-            const row = this.emojis.slice(i, i + emojiPerRow).map(emoji =>
-                Markup.button.callback(emoji, `select_emoji_${emoji}`)
-            );
-            buttons.push(row);
-        }
-
-        await ctx.reply(
-            '🎨 Выберите ваш любимый эмодзи:',
-            Markup.inlineKeyboard(buttons)
-        );
-    }
+    
 
     private async showMainMenu(ctx: BotContext) {
         try {
@@ -1073,7 +1070,7 @@ class StarBot {
             const keyboard = Markup.inlineKeyboard([
                 [
                     Markup.button.callback('🎮 Играть', 'play_games'),
-                    Markup.button.callback('👥 Рефералы', 'show_referrals')
+                    Markup.button.callback('👥 Звёзды за друзей', 'show_referrals')
                 ],
                 [
                     Markup.button.callback('💰 Вывод средств', 'withdraw'),
@@ -1260,7 +1257,7 @@ class StarBot {
 
         try {
             const user = ctx.user!;
-            const minWithdraw = 100;
+            const minWithdraw = 50;
 
             // ПРОВЕРКА USERNAME - отправляем как сообщение
             if (!user.username) {
@@ -1578,7 +1575,7 @@ class StarBot {
     private async showWithdrawMenu(ctx: BotContext) {
         try {
             const user = ctx.user!;
-            const minWithdraw = 100;
+            const minWithdraw = 50;
             ctx.waitingForWithdrawAmount = true;
             const menuText =
                 `💰 *Вывод средств*\n` +
@@ -1589,14 +1586,15 @@ class StarBot {
 
             const keyboard = Markup.inlineKeyboard([
                 [
+                    Markup.button.callback('50 ⭐', 'withdraw_50'),
                     Markup.button.callback('100 ⭐', 'withdraw_100'),
-                    Markup.button.callback('150 ⭐', 'withdraw_150')
                 ],
                 [
+                    Markup.button.callback('150 ⭐', 'withdraw_150'),
                     Markup.button.callback('200 ⭐', 'withdraw_200'),
-                    Markup.button.callback('500 ⭐', 'withdraw_500')
                 ],
                 [
+                    Markup.button.callback('500 ⭐', 'withdraw_500'),
                     Markup.button.callback('Все ⭐', 'withdraw_all')
                 ],
                 [
