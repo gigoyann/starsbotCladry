@@ -7,6 +7,7 @@ import { Withdrawal } from './entities/Withdrawal';
 import { Game } from './entities/Game';
 import axios from 'axios';
 import { GoogleSheetsService } from './services/google-sheets.service';
+import { Captcha } from './entities/Captcha';
 
 dotenv.config();
 
@@ -22,11 +23,44 @@ interface BotContext extends Context {
 
 class StarBot {
     private bot: Telegraf<BotContext>;
+    private captchaStore = new Map<number, {
+        correctEmoji: string;
+        options: string[];
+        selected: number[];
+        attempts: number;
+        userId: number;
+    }>();
+
     private channels: string[] = process.env.CHANNELS?.split(',') || [];
     private emojis: string[] = process.env.EMOJIS?.split(',') || ['⭐', '🌟', '✨', '💫'];
     private adminId: number = parseInt(process.env.ADMIN_ID || '0');
     private adminIds: number[]; // Массив для нескольких админов
+    private sheetsUpdateTimeouts: Map<number, NodeJS.Timeout> = new Map();
+    private readonly SHEETS_UPDATE_DELAY = 3000; // 3 секунды задержки
+    private async scheduleSheetsUpdate(user: User): Promise<void> {
+        const userId = user.telegramId;
 
+        // Отменяем предыдущий таймаут для этого пользователя
+        if (this.sheetsUpdateTimeouts.has(userId)) {
+            clearTimeout(this.sheetsUpdateTimeouts.get(userId));
+        }
+
+        // Устанавливаем новый таймаут
+        const timeout = setTimeout(async () => {
+            try {
+                if (this.googleSheets) {
+                    await this.googleSheets.updateUserInSheets(user);
+                    console.log(`✅ Отложенное обновление для пользователя ${userId}`);
+                }
+            } catch (error) {
+                console.error(`❌ Ошибка отложенного обновления для ${userId}:`, error);
+            } finally {
+                this.sheetsUpdateTimeouts.delete(userId);
+            }
+        }, this.SHEETS_UPDATE_DELAY);
+
+        this.sheetsUpdateTimeouts.set(userId, timeout);
+    }
     private googleSheets: GoogleSheetsService;
     private async setupBotCommands() {
         try {
@@ -103,44 +137,45 @@ class StarBot {
 
     private startPeriodicTasks() {
         if (this.googleSheets) {
-            // Каждые 2 минуты: проверяем изменения ИЗ таблицы в БД
+            console.log('⏰ Запуск периодических задач Google Sheets...');
+
+            // Каждые 5 минут: проверяем только выплаты ИЗ таблицы
             setInterval(async () => {
                 try {
-                    console.log('🔍 Проверка изменений в Google Sheets...');
-
-                    // Проверяем все изменения из таблицы
+                    console.log('🔍 Проверка выплат из Google Sheets...');
                     const updatedWithdrawals = await this.googleSheets.checkAndUpdateWithdrawals();
-                    const updatedBalances = await this.googleSheets.syncUserBalanceFromSheets();
-                    const updatedStatuses = await this.googleSheets.syncUserStatusFromSheets(); // ← ДОБАВЬТЕ ЭТУ СТРОКУ!
 
-                    if (updatedWithdrawals > 0 || updatedBalances > 0 || updatedStatuses > 0) {
-                        console.log(`✅ Обновлено из таблицы: ${updatedWithdrawals} выплат, ${updatedBalances} балансов, ${updatedStatuses} статусов`);
+                    if (updatedWithdrawals > 0) {
+                        console.log(`✅ Обновлено выплат из таблицы: ${updatedWithdrawals}`);
                     }
                 } catch (error) {
-                    console.error('❌ Ошибка проверки изменений:', error);
+                    console.error('❌ Ошибка проверки выплат:', error);
                 }
-            }, 2 * 60 * 1000); // 2 минуты
-            // Каждый час: добавляем только новые данные В таблицу
+            }, 5 * 60 * 1000); // 5 минут
+
+            // Каждый час: добавляем новые данные В таблицу (но НЕ обновляем балансы обратно)
             setInterval(async () => {
                 try {
+                    console.log('🔄 Ежечасная синхронизация с Google Sheets...');
                     await this.googleSheets.syncNewWithdrawalsOnly();
-                    await this.googleSheets.syncAllUsersWithoutOverwrite(); // ← Только новые пользователи
-                    console.log('✅ Ежечасное добавление новых данных завершено');
+                    await this.googleSheets.syncNewUsersOnly(); // Только НОВЫЕ пользователи
+                    console.log('✅ Ежечасная синхронизация завершена');
                 } catch (error) {
-                    console.error('❌ Ошибка добавления новых данных:', error);
+                    console.error('❌ Ошибка ежечасной синхронизации:', error);
                 }
             }, 60 * 60 * 1000); // 1 час
 
-            // Каждые 24 часа: полная синхронная синхронизация (с осторожностью!)
+            // Каждые 24 часа: полная синхронизация ТОЛЬКО из БД в таблицу
             setInterval(async () => {
                 try {
-                    // Используем двустороннюю синхронизацию с правильным порядком
-                    await this.googleSheets.bidirectionalSync();
-                    console.log('✅ Ежедневная полная синхронизация завершена');
+                    console.log('📊 Ежедневная полная синхронизация...');
+                    // Только односторонняя: БД → Google Sheets
+                    await this.googleSheets.fullSyncToSheets();
+                    console.log('✅ Ежедневная синхронизация завершена');
                 } catch (error) {
                     console.error('❌ Ошибка ежедневной синхронизации:', error);
                 }
-            }, 5 * 60 * 1000); // 5 мин
+            }, 24 * 60 * 60 * 1000); // 24 часа
         }
     }
     private isAdmin(userId: number): boolean {
@@ -423,13 +458,31 @@ class StarBot {
             const userId = ctx.from.id;
             const user = ctx.user!;
 
-            // Проверяем реферальную ссылку
+            console.log(`🚀 Start command from user ${userId}, completedInitialSetup: ${user.completedInitialSetup}`);
+
+            // Обработка реферальной ссылки ДО проверки setup
             const args = ctx.message.text.split(' ');
             if (args.length > 1) {
                 const referrerId = parseInt(args[1]);
-                if (!user.referrerId && referrerId !== userId) {
-                    user.referrerId = referrerId;
-                    await AppDataSource.getRepository(User).save(user);
+                console.log(`🔗 Referral detected: referrerId=${referrerId}, currentUserId=${userId}`);
+
+                // Проверяем что это не самоприсваивание
+                if (!user.referrerId && referrerId && referrerId !== userId) {
+                    console.log(`✅ Setting referrer ${referrerId} for user ${userId}`);
+
+                    // Проверяем существование реферера
+                    const referrerRepository = AppDataSource.getRepository(User);
+                    const referrer = await referrerRepository.findOne({
+                        where: { telegramId: referrerId }
+                    });
+
+                    if (referrer) {
+                        user.referrerId = referrer.id; // Сохраняем ID реферера из БД
+                        await AppDataSource.getRepository(User).save(user);
+                        console.log(`✅ Referrer ${referrerId} saved for user ${userId}`);
+                    } else {
+                        console.log(`❌ Referrer ${referrerId} not found in database`);
+                    }
                 }
             }
 
@@ -445,6 +498,9 @@ class StarBot {
             }
         });
 
+        this.bot.command('my_withdrawals', async (ctx) => {
+            await this.showUserWithdrawals(ctx);
+        });
         // Команда для синхронизации
         this.bot.command('sync_sheets', async (ctx) => {
             if (ctx.from.id !== this.adminId) {
@@ -456,7 +512,10 @@ class StarBot {
             await this.googleSheets.fullSync();
             await ctx.reply('✅ Синхронизация завершена');
         });
-
+        this.bot.action('show_balance', async (ctx) => {
+            await ctx.answerCbQuery();
+            await this.showUserBalance(ctx);
+        });
         // Команда для открытия таблицы
         this.bot.command('sheet', async (ctx) => {
             if (ctx.from.id !== this.adminId) {
@@ -488,7 +547,10 @@ class StarBot {
             await this.showHelp(ctx);
         });
 
-
+        this.bot.action('show_my_withdrawals', async (ctx) => {
+            await ctx.answerCbQuery();
+            await this.showUserWithdrawals(ctx);
+        });
         this.bot.action('play_games', async (ctx) => {
             await ctx.answerCbQuery();
             await this.showGamesMenu(ctx);
@@ -598,11 +660,28 @@ class StarBot {
             );
         });
 
+        this.bot.command('check_ref', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав!');
+                return;
+            }
 
+            const user = ctx.user!;
+            await ctx.reply(
+                `🔍 *Информация о рефералах:*\n\n` +
+                `👤 Ваш ID: ${user.id}\n` +
+                `🆔 Telegram ID: ${user.telegramId}\n` +
+                `👥 Рефералов: ${user.referralsCount}\n` +
+                `🔗 ID реферера: ${user.referrerId || 'Нет'}\n` +
+                `⭐ Звезд с рефералов: ${(user.referralsCount || 0) * 3}`,
+                { parse_mode: 'Markdown' }
+            );
+        });
 
         this.bot.command('referral', async (ctx) => {
             const user = ctx.user!;
             const referralLink = `https://t.me/${ctx.botInfo.username}?start=${user.telegramId}`;
+            const earnedFromReferrals = (user.referralsCount || 0) * 3;
 
             await ctx.reply(
                 `👥 *Реферальная система*\n` +
@@ -611,9 +690,9 @@ class StarBot {
                 `${referralLink}\n\n` +
                 `📊 Статистика:\n` +
                 `• Приглашено: ${user.referralsCount || 0}\n` +
-                `• Заработано: ${(user.referralsCount || 0) * 3} ⭐\n\n` +
+                `• Заработано: ${earnedFromReferrals} ⭐\n\n` +
                 `💰 *Награды:*\n` +
-                `• Вы: +3⭐ за каждого друга\n` +
+                `• Вы: +5⭐ за каждого друга\n` +
                 `• Друг: +10⭐ при регистрации\n` +
                 `═══════════════════`,
                 { parse_mode: 'Markdown' }
@@ -691,14 +770,16 @@ class StarBot {
         });
 
         // 4. Обработчики регистрации и подписки
+
         this.bot.action(/^check_subscription_(\d+)$/, async (ctx) => {
             const userId = parseInt(ctx.match[1]);
             const user = await this.getUser(userId);
 
+            console.log(`🔍 Проверка подписки для пользователя ${userId}`);
+
             const isSubscribed = await this.checkAllSubscriptions(userId);
 
             if (isSubscribed) {
-                // Проверяем, не получал ли уже бонус
                 if (user.completedInitialSetup) {
                     await ctx.answerCbQuery('✅ Вы уже завершили регистрацию');
                     await this.showMainMenu(ctx);
@@ -706,57 +787,64 @@ class StarBot {
                 }
 
                 user.subscribedToChannels = true;
-                user.completedInitialSetup = true;
-                user.stars += 10;
-                user.totalEarned += 10;
-
-                // Реферальный бонус
-                if (user.referrerId) {
-                    const referrer = await AppDataSource.getRepository(User).findOne({
-                        where: { telegramId: user.referrerId }
-                    });
-
-                    if (referrer) {
-                        referrer.stars += 3;
-                        referrer.referralsCount = (referrer.referralsCount || 0) + 1;
-                        await AppDataSource.getRepository(User).save(referrer);
-
-                        await ctx.telegram.sendMessage(
-                            referrer.telegramId,
-                            `🎉 По вашей ссылке зарегистрировался новый пользователь! Вам начислено +3 звезды!`
-                        );
-                    }
-                }
-
                 await AppDataSource.getRepository(User).save(user);
 
-                // Удаляем сообщение с кнопками подписки
+                await ctx.answerCbQuery('✅ Подписка подтверждена!');
+
+                // Удаляем старое сообщение если есть
                 try {
                     if (ctx.callbackQuery?.message) {
                         await ctx.deleteMessage();
                     }
-                } catch (error) {
-                    console.log('⚠️ Не удалось удалить сообщение');
+                } catch (e) {
+                    // Игнорируем ошибку удаления
                 }
 
-                // Приветственное сообщение
-                await ctx.reply(
-                    `🎉 *Регистрация завершена!*\n\n` +
-                    `✅ Вы успешно подписались на каналы\n` +
-                    `💰 Начислено: 10 звезд\n` +
-                    `📊 Баланс: ${user.stars} ⭐\n\n` +
-                    `🎮 Теперь вы можете играть и зарабатывать!`,
-                    { parse_mode: 'Markdown' }
-                );
+                // Показываем капчу
+                await this.showEmojiCaptcha(ctx);
 
-                await this.showMainMenu(ctx);
             } else {
                 await ctx.answerCbQuery('❌ Вы не подписались на все каналы');
             }
         });
+        this.bot.action(/^captcha_emoji_(\d+)_(\d+)$/, async (ctx) => {
+            const captchaId = parseInt(ctx.match[1]);
+            const selectedIndex = parseInt(ctx.match[2]);
+            await this.handleEmojiCaptchaSelection(ctx, captchaId, selectedIndex);
+        });
+
+        // Обработчик для обновления капчи
+        this.bot.action(/^refresh_captcha_(\d+)$/, async (ctx) => {
+            const captchaId = parseInt(ctx.match[1]);
+
+            // Удаляем старую капчу
+            const captchaRepository = AppDataSource.getRepository(Captcha);
+            await captchaRepository.delete({ id: captchaId });
+
+            await ctx.answerCbQuery('🔄 Загружаем новую капчу...');
+            await this.showEmojiCaptcha(ctx);
+        });
+
+        // Обработчик для отмены капчи
+        this.bot.action('cancel_captcha', async (ctx) => {
+            await ctx.answerCbQuery('❌ Регистрация отменена');
+
+            try {
+                if (ctx.callbackQuery?.message) {
+                    await ctx.deleteMessage();
+                }
+            } catch (e) {
+                // Игнорируем ошибку удаления
+            }
+
+            await ctx.reply(
+                '❌ Регистрация не завершена.\n' +
+                'Если хотите попробовать снова, используйте /start',
+                { parse_mode: 'Markdown' }
+            );
+        });
 
 
-        
         // 5. Админ панель
         this.bot.command('admin', async (ctx) => {
             if (ctx.from.id === this.adminId) {
@@ -801,7 +889,223 @@ class StarBot {
         });
 
     }
+    private async showUserWithdrawals(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+            const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
 
+            // Получаем все заявки пользователя
+            const withdrawals = await withdrawalRepository.find({
+                where: { userId: user.id },
+                order: { createdAt: 'DESC' },
+                take: 20 // Ограничиваем последними 20 заявками
+            });
+
+            if (withdrawals.length === 0) {
+                await ctx.reply(
+                    '📭 *У вас пока нет заявок на вывод*\n\n' +
+                    'Чтобы создать первую заявку:\n' +
+                    '1. Нажмите "💰 Вывод средств"\n' +
+                    '2. Выберите сумму\n' +
+                    '3. Дождитесь обработки администратором\n\n' +
+                    'Минимальная сумма вывода: 50 ⭐',
+                    { parse_mode: 'Markdown' }
+                );
+                return;
+            }
+
+            // Группируем заявки по статусу (только 3 статуса)
+            const pending = withdrawals.filter(w => w.status === 'pending');
+            const approved = withdrawals.filter(w => w.status === 'approved');
+            const rejected = withdrawals.filter(w => w.status === 'rejected');
+
+            // Статистика
+            const totalAmount = withdrawals.reduce((sum, w) => sum + w.amount, 0);
+            const pendingAmount = pending.reduce((sum, w) => sum + w.amount, 0);
+            const approvedAmount = approved.reduce((sum, w) => sum + w.amount, 0);
+            const rejectedAmount = rejected.reduce((sum, w) => sum + w.amount, 0);
+
+            let message = `📋 *Ваши заявки на вывод*\n\n`;
+
+            // Общая статистика
+            message += `📊 *Статистика:*\n`;
+            message += `• Всего заявок: ${withdrawals.length}\n`;
+            message += `• Общая сумма: ${totalAmount} ⭐\n\n`;
+
+            // По статусам
+            message += `⏳ *В ожидании (${pending.length}):*\n`;
+            if (pending.length > 0) {
+                pending.forEach((w, index) => {
+                    const date = w.createdAt.toLocaleDateString('ru-RU');
+                    const time = w.createdAt.toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    message += `  ${index + 1}. #${w.id} - ${w.amount}⭐ (${date} ${time})\n`;
+                });
+            } else {
+                message += `  Нет заявок\n`;
+            }
+            message += `  Всего в ожидании: ${pendingAmount} ⭐\n\n`;
+
+            message += `✅ *Одобренные (${approved.length}):*\n`;
+            if (approved.length > 0) {
+                approved.forEach((w, index) => {
+                    const date = w.processedAt
+                        ? new Date(w.processedAt).toLocaleDateString('ru-RU')
+                        : 'в обработке';
+                    const time = w.processedAt
+                        ? new Date(w.processedAt).toLocaleTimeString('ru-RU', {
+                            hour: '2-digit',
+                            minute: '2-digit'
+                        })
+                        : '';
+                    message += `  ${index + 1}. #${w.id} - ${w.amount}⭐ (${date}${time ? ' ' + time : ''})\n`;
+                });
+            } else {
+                message += `  Нет заявок\n`;
+            }
+            message += `  Всего одобрено: ${approvedAmount} ⭐\n\n`;
+
+            message += `❌ *Отклоненные (${rejected.length}):*\n`;
+            if (rejected.length > 0) {
+                rejected.forEach((w, index) => {
+                    const date = w.processedAt
+                        ? new Date(w.processedAt).toLocaleDateString('ru-RU')
+                        : '-';
+                    const time = w.processedAt
+                        ? new Date(w.processedAt).toLocaleTimeString('ru-RU', {
+                            hour: '2-digit',
+                            minute: '2-digit'
+                        })
+                        : '';
+                    message += `  ${index + 1}. #${w.id} - ${w.amount}⭐ (${date}${time ? ' ' + time : ''})\n`;
+                });
+            } else {
+                message += `  Нет заявок\n`;
+            }
+            message += `  Всего отклонено: ${rejectedAmount} ⭐\n\n`;
+
+            // Последние 5 заявок подробно
+            message += `────────────────────\n`;
+            message += `📝 *Последние 5 заявок:*\n\n`;
+
+            const recentWithdrawals = withdrawals.slice(0, 5);
+            recentWithdrawals.forEach((withdrawal, index) => {
+                const statusEmoji = {
+                    'pending': '⏳',
+                    'approved': '✅',
+                    'rejected': '❌'
+                }[withdrawal.status] || '❓';
+
+                const statusText = {
+                    'pending': 'В ожидании',
+                    'approved': 'Одобрена',
+                    'rejected': 'Отклонена'
+                }[withdrawal.status] || withdrawal.status;
+
+                const date = withdrawal.createdAt.toLocaleDateString('ru-RU');
+                const time = withdrawal.createdAt.toLocaleTimeString('ru-RU', {
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+
+                message += `${statusEmoji} *Заявка #${withdrawal.id}*\n`;
+                message += `Сумма: ${withdrawal.amount} ⭐\n`;
+                message += `Статус: ${statusText}\n`;
+                message += `Дата создания: ${date} ${time}\n`;
+
+                if (withdrawal.processedAt) {
+                    const processedDate = new Date(withdrawal.processedAt).toLocaleDateString('ru-RU');
+                    const processedTime = new Date(withdrawal.processedAt).toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    message += `Обработана: ${processedDate} ${processedTime}\n`;
+                }
+
+                message += `────────────────────\n`;
+            });
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '💰 Создать заявку', callback_data: 'withdraw' },
+                        { text: '📊 Баланс', callback_data: 'show_balance' }
+                    ],
+                    [
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]
+                ]
+            };
+
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+            });
+
+        } catch (error) {
+            console.error('❌ Error showing user withdrawals:', error);
+            await ctx.reply('❌ Ошибка при загрузке заявок. Попробуйте позже.');
+        }
+    }
+
+    private async showUserBalance(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+
+            // Получаем статистику выплат
+            const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
+            const withdrawals = await withdrawalRepository.find({
+                where: { userId: user.id }
+            });
+
+            const totalWithdrawn = withdrawals
+                .filter(w => w.status === 'approved') // Только approved
+                .reduce((sum, w) => sum + w.amount, 0);
+
+            const pendingWithdrawn = withdrawals
+                .filter(w => w.status === 'pending')
+                .reduce((sum, w) => sum + w.amount, 0);
+
+            const message = `💰 *Ваш баланс*\n\n` +
+                `⭐ Звезды: ${user.stars}\n` +
+                `💰 Всего заработано: ${user.totalEarned || 0}\n\n` +
+                `📊 *Статистика выплат:*\n` +
+                `• Одобрено к выплате: ${totalWithdrawn} ⭐\n` +
+                `• В ожидании вывода: ${pendingWithdrawn} ⭐\n` +
+                `• Всего заявок: ${withdrawals.length}\n\n` +
+                `💳 *Минимальный вывод:* 50 ⭐`;
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '📋 Мои заявки', callback_data: 'show_my_withdrawals' },
+                        { text: '💰 Вывод', callback_data: 'withdraw' }
+                    ],
+                    [
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]
+                ]
+            };
+
+            if (ctx.callbackQuery) {
+                await ctx.editMessageText(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            } else {
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Error showing user balance:', error);
+            await ctx.reply('❌ Ошибка при загрузке баланса.');
+        }
+    }
     private setupMiddlewares() {
         // Middleware для получения пользователя
         this.bot.use(async (ctx, next) => {
@@ -956,7 +1260,7 @@ class StarBot {
 
                 user = userRepository.create({
                     telegramId,
-                    username: from?.username || null, // Используем from если передан
+                    username: from?.username || null,
                     firstName: from?.first_name || null,
                     lastName: from?.last_name || null,
                     stars: 0,
@@ -965,38 +1269,13 @@ class StarBot {
                     status: 'active',
                     completedInitialSetup: false,
                     subscribedToChannels: false,
+                    // НЕ устанавливаем referrerId здесь - это будет сделано в обработчике /start
                 });
 
                 await userRepository.save(user);
                 console.log(`✅ Created new user: ID ${user.id}, Telegram ID ${telegramId}`);
-
-                if (this.googleSheets) {
-                    setTimeout(async () => {
-                        await this.googleSheets.syncUser(user!);
-                    }, 1000);
-                }
-            } else if (from) {
-                // Обновить информацию о пользователе если она изменилась
-                const needsUpdate =
-                    user.username !== from.username ||
-                    user.firstName !== from.first_name ||
-                    user.lastName !== from.last_name;
-
-                if (needsUpdate) {
-                    user.username = from.username || user.username;
-                    user.firstName = from.first_name || user.firstName;
-                    user.lastName = from.last_name || user.lastName;
-                    await userRepository.save(user);
-                    console.log(`🔄 Updated user info for ID ${user.id}`);
-                }
             }
 
-            // Убедимся, что поля не undefined
-            user.totalEarned = user.totalEarned || 0;
-            user.completedInitialSetup = user.completedInitialSetup || false;
-            user.subscribedToChannels = user.subscribedToChannels || false;
-
-            console.log(`✅ User loaded: ID ${user.id}, Telegram ID ${user.telegramId}, Username: ${user.username || 'no username'}`);
             return user;
         } catch (error) {
             console.error('❌ Error getting user:', error);
@@ -1053,18 +1332,30 @@ class StarBot {
         }
     }
 
-    
+
 
     private async showMainMenu(ctx: BotContext) {
         try {
             const user = ctx.user!;
 
+            // ОБНОВЛЯЕМ пользователя из БД, чтобы получить актуальные данные
+            const userRepository = AppDataSource.getRepository(User);
+            const updatedUser = await userRepository.findOne({
+                where: { id: user.id },
+                select: ['stars', 'referralsCount', 'firstName']
+            });
+
+            // Если нашли обновленного пользователя, используем его данные
+            const currentStars = updatedUser?.stars || user.stars;
+            const currentReferrals = updatedUser?.referralsCount || user.referralsCount;
+            const currentFirstName = updatedUser?.firstName || user.firstName;
+
             const menuText =
                 `🎮 *Главное меню*\n` +
                 `═══════════════════\n` +
-                `👤 Имя: ${user.firstName || 'Аноним'}\n` +
-                `⭐ Баланс: ${user.stars} ⭐\n` +
-                `👥 Рефералов: ${user.referralsCount || 0}\n` +
+                `👤 Имя: ${currentFirstName || 'Аноним'}\n` +
+                `⭐ Баланс: ${currentStars} ⭐\n` +
+                `👥 Рефералов: ${currentReferrals || 0}\n` +
                 `═══════════════════`;
 
             const keyboard = Markup.inlineKeyboard([
@@ -1074,17 +1365,28 @@ class StarBot {
                 ],
                 [
                     Markup.button.callback('💰 Вывод средств', 'withdraw'),
+                    Markup.button.callback('📋 Мои заявки', 'show_my_withdrawals') // ← НОВАЯ КНОПКА
                 ],
                 [
                     Markup.button.callback('❓ Помощь', 'show_help')
                 ]
             ]);
 
+            // ВАЖНО: Если это callbackQuery и мы удалили сообщение, отправляем новое
             if (ctx.callbackQuery) {
-                await ctx.editMessageText(menuText, {
-                    parse_mode: 'Markdown',
-                    ...keyboard
-                });
+                try {
+                    await ctx.editMessageText(menuText, {
+                        parse_mode: 'Markdown',
+                        ...keyboard
+                    });
+                } catch (editError: any) {
+                    // Если нельзя отредактировать (сообщение удалено), отправляем новое
+                    console.log('⚠️ Cannot edit message, sending new one');
+                    await ctx.reply(menuText, {
+                        parse_mode: 'Markdown',
+                        ...keyboard
+                    });
+                }
             } else {
                 await ctx.reply(menuText, {
                     parse_mode: 'Markdown',
@@ -1093,7 +1395,29 @@ class StarBot {
             }
         } catch (error: any) {
             console.error('❌ Error in showMainMenu:', error);
-            await ctx.reply('❌ Ошибка при отображении меню. Попробуйте снова.');
+
+            // Всегда отправляем новое сообщение при ошибке
+            try {
+                await ctx.reply('🎮 *Главное меню*\n\nНажмите на кнопки ниже:', {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '🎮 Играть', callback_data: 'play_games' },
+                                { text: '👥 Звёзды за друзей', callback_data: 'show_referrals' }
+                            ],
+                            [
+                                { text: '💰 Вывод средств', callback_data: 'withdraw' }
+                            ],
+                            [
+                                { text: '❓ Помощь', callback_data: 'show_help' }
+                            ]
+                        ]
+                    }
+                });
+            } catch (finalError) {
+                console.error('❌ Fatal error in showMainMenu:', finalError);
+            }
         }
     }
 
@@ -1148,6 +1472,9 @@ class StarBot {
             const user = ctx.user!;
             const referralLink = `https://t.me/${ctx.botInfo.username}?start=${user.telegramId}`;
 
+            // Расчет заработанных звезд (3 за каждого реферала)
+            const earnedFromReferrals = (user.referralsCount || 0) * 3;
+
             const menuText =
                 `👥 *Реферальная система*\n` +
                 `═══════════════════\n` +
@@ -1155,10 +1482,10 @@ class StarBot {
                 `\`${referralLink}\`\n\n` +
                 `📊 Статистика:\n` +
                 `• Приглашено: ${user.referralsCount || 0}\n` +
-                `• Заработано: ${(user.referralsCount || 0) * 3} ⭐\n\n` +
+                `• Заработано: ${earnedFromReferrals} ⭐\n\n` +
                 `💰 *Награды:*\n` +
                 `• Вы: +5⭐ за каждого друга\n` +
-                `• Друг: +30⭐ при регистрации\n` +
+                `• Друг: +10⭐ при регистрации\n` +
                 `═══════════════════`;
 
             const keyboard = Markup.inlineKeyboard([
@@ -1187,6 +1514,7 @@ class StarBot {
             await ctx.reply('❌ Ошибка при отображении рефералов.');
         }
     }
+
 
     // Метод для копирования реферальной ссылки
     private async copyReferralLink(ctx: BotContext) {
@@ -1253,56 +1581,20 @@ class StarBot {
     }
 
     private async processWithdraw(ctx: BotContext, amount: number) {
-        console.log('started process');
+        console.log('🚀 Начало обработки вывода');
 
         try {
             const user = ctx.user!;
             const minWithdraw = 50;
 
-            // ПРОВЕРКА USERNAME - отправляем как сообщение
+            // Проверка username
             if (!user.username) {
-                const message =
-                    '❌ *Для вывода средств необходим username в Telegram!*\n\n' +
-                    'Пожалуйста, настройте username в настройках Telegram и попробуйте снова.\n' +
-                    'Путь: Настройки → Изменить профиль → Username\n\n' +
-                    '📌 *Важно:* Без username мы не сможем связаться с вами для подтверждения выплаты.';
-
-                // ВАЖНО: Сначала отвечаем на callback query (если он есть)
-                if (ctx.callbackQuery) {
-                    await ctx.answerCbQuery('❌ Username не указан'); // Короткое уведомление
-
-                    // Теперь отправляем полноценное сообщение
-                    try {
-                        if (ctx.callbackQuery.message) {
-                            // Редактируем текущее сообщение
-                            await ctx.editMessageText(message, {
-                                parse_mode: 'Markdown',
-                                reply_markup: {
-                                    inline_keyboard: [[
-                                        { text: '🔄 Проверить снова', callback_data: 'withdraw' },
-                                        { text: '⬅️ В меню', callback_data: 'back_to_menu' }
-                                    ]]
-                                }
-                            });
-                        } else {
-                            // Если нельзя отредактировать, отправляем новое сообщение
-                            await ctx.reply(message, { parse_mode: 'Markdown' });
-                        }
-                    } catch (editError) {
-                        // Если ошибка редактирования, отправляем новое сообщение
-                        await ctx.reply(message, { parse_mode: 'Markdown' });
-                    }
-                } else {
-                    // Если это обычная команда /withdraw
-                    await ctx.reply(message, { parse_mode: 'Markdown' });
-                }
-
-                // Сбрасываем флаг ожидания суммы
-                ctx.waitingForWithdrawAmount = false;
+                const message = '❌ *Для вывода средств необходим username в Telegram!*';
+                await this.sendErrorMessage(ctx, message, 'withdraw');
                 return;
             }
 
-            // Проверка минимальной суммы (тоже исправляем для callback query)
+            // Проверка минимальной суммы
             if (amount < minWithdraw) {
                 const message = `❌ Минимальная сумма: ${minWithdraw} ⭐`;
                 await this.sendErrorMessage(ctx, message, 'withdraw');
@@ -1318,54 +1610,55 @@ class StarBot {
 
             // Снимаем средства с баланса пользователя
             user.stars -= amount;
-            await AppDataSource.getRepository(User).save(user);
+            console.log(`💰 Списано ${amount} звезд. Новый баланс пользователя ${user.telegramId}: ${user.stars}`);
 
-            // Создаем заявку на вывод и получаем её ID
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                    console.log(`✅ Баланс обновлен в Google Sheets`);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
+
+            // Создаем заявку на вывод
             const withdrawal = await this.createWithdrawalRequest(user, amount);
 
-            // Отправляем подтверждение пользователю
-            const confirmationMessage =
-                `✅ *Заявка на вывод #${withdrawal.id} создана!*\n\n` +
-                `💰 Сумма: ${amount} ⭐\n` +
-                `📊 Новый баланс: ${user.stars} ⭐\n` +
-                `👤 Ваш ID: ${user.telegramId}\n` +
-                `👤 Имя: ${user.firstName || 'Не указано'}\n` +
-                `👤 Username: @${user.username || 'Не указан'}\n` +
-                `⏱️ Статус: В обработке\n` +
-                `📅 Дата: ${new Date().toLocaleString('ru-RU')}\n\n` +
-                `⚠️ Заявка будет обработана в течение 24 часов.\n` +
-                `📞 Для ускорения свяжитесь с администратором.`;
+            // Отправляем подтверждение
+            const confirmationMessage = `✅ *Заявка на вывод #${withdrawal.id} создана!*`;
 
-            ctx.waitingForWithdrawAmount = false;
-
-            // Если это callback query, сначала отвечаем на него, затем отправляем сообщение
             if (ctx.callbackQuery) {
                 await ctx.answerCbQuery(`✅ Заявка #${withdrawal.id} на ${amount}⭐ отправлена!`);
-
-                // Редактируем текущее сообщение или отправляем новое
                 try {
                     if (ctx.callbackQuery.message) {
                         await ctx.editMessageText(confirmationMessage, {
                             parse_mode: 'Markdown'
                         });
-                    } else {
-                        await ctx.reply(confirmationMessage, { parse_mode: 'Markdown' });
                     }
                 } catch (editError) {
-                    // Если нельзя отредактировать (например, сообщение слишком старое), отправляем новое
                     await ctx.reply(confirmationMessage, { parse_mode: 'Markdown' });
                 }
             } else {
-                // Если это обычное сообщение, просто отвечаем
                 await ctx.reply(confirmationMessage, { parse_mode: 'Markdown' });
             }
 
+            // Сбрасываем флаг
+            ctx.waitingForWithdrawAmount = false;
+
             // Синхронизируем с Google Sheets
             if (this.googleSheets) {
-                await this.googleSheets.syncWithdrawalSimple(withdrawal, this.bot);
+                try {
+                    await this.googleSheets.syncWithdrawalSimple(withdrawal, this.bot);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка синхронизации выплаты:', sheetError);
+                }
             }
 
-            // Отправляем уведомление администратору
+            // Уведомляем администратора
             await this.notifyAdminAboutWithdrawal(user, amount, withdrawal.id);
 
         } catch (error) {
@@ -1375,16 +1668,21 @@ class StarBot {
             if (ctx.user) {
                 ctx.user.stars += amount;
                 await AppDataSource.getRepository(User).save(ctx.user);
+
+                // Обновляем таблицу
+                if (this.googleSheets) {
+                    try {
+                        await this.googleSheets.updateUserInSheets(ctx.user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка возврата баланса в таблицу:', sheetError);
+                    }
+                }
             }
 
             const errorMessage = '❌ Ошибка при создании заявки';
-
             if (ctx.callbackQuery) {
                 await ctx.answerCbQuery(errorMessage);
-            } else {
-                await ctx.reply(errorMessage);
             }
-
             await ctx.reply('❌ Произошла ошибка при создании заявки. Попробуйте позже.');
         }
     }
@@ -1420,86 +1718,7 @@ class StarBot {
     }
 
 
-    // Метод для уведомления пользователя об изменении статуса выплаты
-    private async notifyUserAboutWithdrawalStatus(withdrawal: Withdrawal, status: string, adminComment?: string) {
-        try {
-            const userRepository = AppDataSource.getRepository(User);
-            const user = await userRepository.findOne({
-                where: { telegramId: withdrawal.telegramId }
-            });
 
-            if (!user) {
-                console.error(`❌ User not found for withdrawal #${withdrawal.id}`);
-                return;
-            }
-
-            let message = '';
-            let keyboard = undefined;
-
-            if (status === 'completed') {
-                message =
-                    `✅ *Заявка на вывод #${withdrawal.id} ОДОБРЕНА!*\n\n` +
-                    `💰 Сумма: ${withdrawal.amount} ⭐\n` +
-                    `📅 Дата обработки: ${new Date().toLocaleString('ru-RU')}\n` +
-                    `👤 Обработано администратором\n\n`;
-
-                if (adminComment) {
-                    message += `💬 Комментарий администратора:\n${adminComment}\n\n`;
-                }
-
-                message += `🎉 Средства будут переведены в ближайшее время.\n` +
-                    `📞 Для уточнений свяжитесь с поддержкой.`;
-
-            } else if (status === 'rejected') {
-                message =
-                    `❌ *Заявка на вывод #${withdrawal.id} ОТКЛОНЕНА!*\n\n` +
-                    `💰 Сумма: ${withdrawal.amount} ⭐\n` +
-                    `📅 Дата отказа: ${new Date().toLocaleString('ru-RU')}\n` +
-                    `👤 Отклонено администратором\n\n`;
-
-                if (adminComment) {
-                    message += `💬 Причина отказа:\n${adminComment}\n\n`;
-                } else {
-                    message += `💬 Причина отказа: не указана\n\n`;
-                }
-
-                message += `💰 *Средства возвращены на ваш баланс!*\n` +
-                    `📊 Новый баланс: ${user.stars} ⭐\n\n` +
-                    `⚠️ Вы можете создать новую заявку с правильными данными.`;
-
-                // Возвращаем средства пользователю
-                user.stars += withdrawal.amount;
-                await userRepository.save(user);
-
-                keyboard = {
-                    inline_keyboard: [[
-                        { text: '💰 Создать новую заявку', callback_data: 'withdraw' },
-                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
-                    ]]
-                };
-
-            } else if (status === 'processing') {
-                message =
-                    `🔄 *Заявка на вывод #${withdrawal.id} в обработке!*\n\n` +
-                    `💰 Сумма: ${withdrawal.amount} ⭐\n` +
-                    `⏳ Статус: Администратор проверяет заявку\n` +
-                    `📅 Начало обработки: ${new Date().toLocaleString('ru-RU')}\n\n` +
-                    `⏰ Обычно обработка занимает до 24 часов.\n` +
-                    `📞 Для ускорения свяжитесь с администратором.`;
-            }
-
-            // Отправляем уведомление пользователю
-            await this.bot.telegram.sendMessage(user.telegramId, message, {
-                parse_mode: 'Markdown',
-                reply_markup: keyboard
-            });
-
-            console.log(`✅ User ${user.telegramId} notified about withdrawal #${withdrawal.id} status: ${status}`);
-
-        } catch (error) {
-            console.error(`❌ Error notifying user about withdrawal #${withdrawal.id}:`, error);
-        }
-    }
     // Метод для создания заявки в БД
     private async createWithdrawalRequest(user: User, amount: number) {
         try {
@@ -1508,7 +1727,7 @@ class StarBot {
             const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
 
             const withdrawal = new Withdrawal();
-            withdrawal.userId = user?.id;
+            withdrawal.userId = user.id; // Используй user.id (число), а не telegramId
             withdrawal.amount = amount;
             withdrawal.wallet = 'user_data';
             withdrawal.status = 'pending';
@@ -1621,247 +1840,6 @@ class StarBot {
 
 
 
-    private setupMenuHandlers() {
-        // Баланс
-        this.bot.hears('💰 Мой баланс', async (ctx) => {
-            const user = ctx.user!;
-            await ctx.reply(
-                `💰 Ваш баланс:\n\n` +
-                `⭐ Звезд: ${user.stars}\n` +
-                `🏆 Всего заработано: ${user.totalEarned}\n` +
-                `👥 Приглашено друзей: ${user.referralsCount}`
-            );
-        });
-
-        // Бонус и игры
-        this.bot.hears('🎮 Бонус и игры', async (ctx) => {
-            await this.showGamesMenu(ctx);
-        });
-
-        // Вывод средств
-        this.bot.hears('📤 Вывод средств', async (ctx) => {
-            const user = ctx.user!;
-
-            if (user.stars < 100) {
-                await ctx.reply(
-                    `❌ Минимальная сумма для вывода: 100 звезд\n` +
-                    `💰 Ваш текущий баланс: ${user.stars} звезд`
-                );
-                return;
-            }
-
-            await ctx.reply(
-                '💳 Для вывода средств введите сумму (от 100 звезд) и кошелек в формате:\n\n' +
-                '`<сумма> <кошелек>`\n\n' +
-                'Пример: `150 U1234567890`',
-                { parse_mode: 'Markdown' }
-            );
-        });
-
-
-
-        // Реферальная система
-        this.bot.hears('👥 Реферальная система', async (ctx) => {
-            const user = ctx.user!;
-            const botUsername = ctx.botInfo.username;
-            const refLink = `https://t.me/${botUsername}?start=${user.telegramId}`;
-
-            await ctx.reply(
-                `👥 Реферальная система\n\n` +
-                `🔗 Ваша реферальная ссылка:\n\`${refLink}\`\n\n` +
-                `💰 За каждого приглашенного друга вы получаете:\n` +
-                `• 3 звезд после его полной регистрации\n\n` +
-                `👥 Приглашено: ${user.referralsCount} друзей\n` +
-                `💎 Всего заработано на рефералах: ${(user.referralsCount * 3)} звезд`,
-                { parse_mode: 'Markdown' }
-            );
-        });
-
-        // Задания
-        this.bot.hears('ℹ️ Задания', async (ctx) => {
-            await ctx.reply(
-                '📋 Актуальных заданий пока нет.\n\n' +
-                'Мы сообщим вам, когда появятся новые задания! 🎯'
-            );
-        });
-
-        // Обработка запроса на вывод
-        this.bot.on('text', async (ctx) => {
-            const message = ctx.message.text;
-            const user = ctx.user!;
-
-            if (message.match(/^\d+\s+\S+$/)) {
-                const [amountStr, wallet] = message.split(/\s+/);
-                const amount = parseInt(amountStr);
-
-                if (amount < 100) {
-                    await ctx.reply('❌ Минимальная сумма для вывода: 100 звезд');
-                    return;
-                }
-
-                if (user.stars < amount) {
-                    await ctx.reply('❌ Недостаточно средств на балансе');
-                    return;
-                }
-
-                // Создаем заявку на вывод
-                const withdrawal = new Withdrawal();
-                withdrawal.userId = user.telegramId;
-                withdrawal.amount = amount;
-                withdrawal.wallet = wallet;
-                withdrawal.status = 'pending';
-
-                await AppDataSource.getRepository(Withdrawal).save(withdrawal);
-
-                // Списание средств
-                user.stars -= amount;
-                await AppDataSource.getRepository(User).save(user);
-
-                // Уведомляем админа
-                const botUsername = ctx.botInfo.username;
-                const userRefLink = `https://t.me/${botUsername}?start=${user.telegramId}`;
-
-                await ctx.telegram.sendMessage(
-                    this.adminId,
-                    `📤 НОВАЯ ЗАЯВКА НА ВЫВОД\n\n` +
-                    `👤 Пользователь: @${user.username || 'Нет username'}\n` +
-                    `🆔 ID: ${user.telegramId}\n` +
-                    `💰 Сумма: ${amount} звезд\n` +
-                    `💳 Кошелек: ${wallet}\n` +
-                    `👥 Рефералов: ${user.referralsCount}\n` +
-                    `🔗 Ссылка на пользователя: ${userRefLink}\n` +
-                    `📊 Всего заработано: ${user.totalEarned} звезд\n\n` +
-                    `🔗 Реферальные ссылки:\n${user.referralLinks?.join('\n') || 'Нет рефералов'}`
-                );
-
-                await ctx.reply(
-                    '✅ Заявка на вывод успешно создана!\n\n' +
-                    '💰 Сумма: ' + amount + ' звезд\n' +
-                    '💳 Кошелек: ' + wallet + '\n\n' +
-                    '⏳ Ожидайте обработки заявки администратором.'
-                );
-            }
-        });
-    }
-
-
-
-
-
-
-    private setupGamesHandlers() {
-        console.log('🎮 Setting up ANIMATED game handlers...');
-
-        // Игры с анимацией Telegram Dice API
-        this.bot.hears('🎰 Игровые автоматы', async (ctx) => {
-            await this.playAnimatedSlots(ctx, 10);
-        });
-
-        this.bot.hears('🎲 Кости с анимацией', async (ctx) => {
-            await this.playAnimatedDice(ctx, 3);
-        });
-
-        this.bot.hears('🎯 Дартс с анимацией', async (ctx) => {
-            await this.playAnimatedDarts(ctx, 4);
-        });
-
-        this.bot.hears('🏀 Баскетбол', async (ctx) => {
-            await this.playAnimatedBasketball(ctx, 5);
-        });
-
-        this.bot.hears('⚽ Футбол', async (ctx) => {
-            await this.playAnimatedFootball(ctx, 5);
-        });
-
-        this.bot.hears('🎳 Боулинг', async (ctx) => {
-            await this.playAnimatedBowling(ctx, 6);
-        });
-
-        // Статистика
-
-
-        // Баланс
-        // this.bot.hears('💰 Мой баланс', async (ctx) => {
-        //     await this.showBalance(ctx);
-        // });
-
-        this.bot.hears('↩️ Назад в меню', async (ctx) => {
-            await this.showMainMenu(ctx);
-        });
-    }
-
-
-    private async playAnimatedGame(
-        ctx: BotContext,
-        betAmount: number,
-        emoji: '🎰' | '🎲' | '🎯' | '🏀' | '⚽' | '🎳',  // Добавлены ⚽ и 🎳
-        gameType: string,
-        calculateWin: (diceValue: number, betAmount: number) => { winAmount: number, resultText: string }
-    ) {
-        try {
-            console.log(`🎮 Starting ${gameType} game with ${emoji}`);
-
-            // Получаем пользователя
-            let user = ctx.user;
-            if (!user) {
-                user = await this.getUser(ctx.from!.id);
-                ctx.user = user;
-            }
-
-            console.log(`💰 User ${user.telegramId} balance: ${user.stars}`);
-
-            // Проверяем баланс
-            if (user.stars < betAmount) {
-                await ctx.reply(`❌ Недостаточно звезд! Нужно: ${betAmount}, у вас: ${user.stars}`);
-                return;
-            }
-
-            // Списываем ставку
-            user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
-            console.log(`💰 Bet ${betAmount} deducted`);
-
-            // Отправляем анимацию
-            console.log(`🎬 Sending ${emoji} animation...`);
-            const animation = await ctx.replyWithDice({ emoji });
-
-            // Ждем завершения анимации
-            await new Promise(resolve => setTimeout(resolve, 4000));
-
-            // Получаем результат
-            const diceValue = animation.dice.value;
-            console.log(`🎮 ${emoji} result value: ${diceValue}`);
-
-            // Рассчитываем выигрыш
-            const winResult = calculateWin(diceValue, betAmount);
-            const { winAmount, resultText } = winResult;
-
-            // Начисляем выигрыш
-            if (winAmount > 0) {
-                user.stars += winAmount;
-                user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
-                console.log(`💰 Win ${winAmount} stars added`);
-            }
-
-            // Сохраняем игру в БД
-            const game = new Game();
-            game.userId = user.telegramId;
-            game.gameType = gameType;
-            game.betAmount = betAmount;
-            game.winAmount = winAmount;
-            game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
-
-            // Показываем результат
-            await this.showAnimatedGameResult(ctx, user, gameType, emoji, diceValue, betAmount, winAmount, resultText);
-
-        } catch (error) {
-            console.error(`❌ Error in ${gameType}:`, error);
-            await ctx.reply(`❌ Ошибка в игре ${gameType}`);
-        }
-    }
-
     private async playAnimatedSlots(ctx: BotContext, betAmount: number) {
         try {
             let user = ctx.user;
@@ -1876,7 +1854,17 @@ class StarBot {
             }
 
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
 
             const animation = await ctx.replyWithDice({ emoji: '🎰' });
             await new Promise(resolve => setTimeout(resolve, 4000));
@@ -1888,11 +1876,20 @@ class StarBot {
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = 'animated_slots';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -1977,34 +1974,83 @@ class StarBot {
                 ctx.user = user;
             }
 
+            console.log(`🎲 Игра в кости: пользователь ${user.telegramId}, баланс: ${user.stars}, ставка: ${betAmount}`);
+
             if (user.stars < betAmount) {
                 await ctx.reply(`❌ Недостаточно звезд! Нужно: ${betAmount}, у вас: ${user.stars}`);
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            console.log(`💰 Списано ${betAmount} звезд. Новый баланс: ${user.stars}`);
 
+            // Сохраняем пользователя
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы после списания:', sheetError);
+                }
+            }
+
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '🎲' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
             const diceValue = animation.dice.value;
+            console.log(`🎲 Выпало: ${diceValue}`);
+
+            // Рассчитываем выигрыш
             const winResult = this.calculateDiceWin(diceValue, betAmount);
             const { winAmount, resultText } = winResult;
 
+            // Начисляем выигрыш если есть
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
+            // Сохраняем пользователя с выигрышем
+            await userRepository.save(user);
+
+            // Снова обновляем Google Sheets с новым балансом
+            if (this.googleSheets && winAmount > 0) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                }
+            }
+
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_dice';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
+
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Игра сохранена в БД: ${game.id}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения игры в БД:', gameError);
+            }
 
             await this.showAnimatedGameResult(ctx, user, 'animated_dice', '🎲', diceValue, betAmount, winAmount, resultText);
 
@@ -2067,7 +2113,17 @@ class StarBot {
             }
 
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
 
             const animation = await ctx.replyWithDice({ emoji: '🎯' });
             await new Promise(resolve => setTimeout(resolve, 4000));
@@ -2079,11 +2135,20 @@ class StarBot {
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = 'animated_darts';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2150,7 +2215,17 @@ class StarBot {
             }
 
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
 
             const animation = await ctx.replyWithDice({ emoji: '🏀' });
             await new Promise(resolve => setTimeout(resolve, 4000));
@@ -2162,11 +2237,20 @@ class StarBot {
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = 'animated_basketball';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2227,7 +2311,17 @@ class StarBot {
             }
 
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
 
             const animation = await ctx.replyWithDice({ emoji: '⚽' });
             await new Promise(resolve => setTimeout(resolve, 4000));
@@ -2239,11 +2333,20 @@ class StarBot {
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = 'animated_football';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2304,7 +2407,17 @@ class StarBot {
             }
 
             user.stars -= betAmount;
-            await AppDataSource.getRepository(User).save(user);
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
 
             const animation = await ctx.replyWithDice({ emoji: '🎳' });
             await new Promise(resolve => setTimeout(resolve, 4000));
@@ -2316,11 +2429,20 @@ class StarBot {
             if (winAmount > 0) {
                 user.stars += winAmount;
                 user.totalEarned += winAmount;
-                await AppDataSource.getRepository(User).save(user);
+                await userRepository.save(user);
+
+                // Снова обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                    }
+                }
             }
 
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = 'animated_bowling';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2508,7 +2630,7 @@ class StarBot {
         try {
             // Сохраняем игру в базу
             const game = new Game();
-            game.userId = user.telegramId;
+            game.userId = user.id;
             game.gameType = gameType;
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2545,7 +2667,347 @@ class StarBot {
         }
     }
 
+    private async createEmojiCaptcha(userId: number): Promise<Captcha> {
+        const captchaRepository = AppDataSource.getRepository(Captcha);
 
+        // Удаляем старые капчи для этого пользователя
+        await captchaRepository.delete({ userId, solved: false });
+
+        // Список эмодзи для капчи
+        const allEmojis = [
+            '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
+            '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚',
+            '😋', '😛', '😜', '🤪', '😝', '🤑', '🤗', '🤭', '🤫', '🤔',
+            '🤐', '🤨', '😐', '😑', '😶', '😏', '😒', '🙄', '😬', '🤥',
+            '😌', '😔', '😪', '🤤', '😴', '😷', '🤒', '🤕', '🤢', '🤮',
+            '🤧', '🥵', '🥶', '🥴', '😵', '🤯', '🤠', '🥳', '😎', '🤓',
+            '🧐', '😕', '😟', '🙁', '😮', '😯', '😲', '😳', '🥺', '😦',
+            '😧', '😨', '😰', '😥', '😢', '😭', '😱', '😖', '😣', '😞',
+            '😓', '😩', '😫', '🥱', '😤', '😡', '😠', '🤬', '😈', '👿',
+            '💀', '☠️', '💩', '🤡', '👹', '👺', '👻', '👽', '👾', '🤖',
+            '😺', '😸', '😹', '😻', '😼', '😽', '🙀', '😿', '😾'
+        ];
+
+        // Выбираем случайный эмодзи как правильный ответ
+        const correctEmoji = allEmojis[Math.floor(Math.random() * allEmojis.length)];
+
+        // Создаем список из 9 эмодзи (3 правильных + 6 неправильных)
+        const options: string[] = [correctEmoji, correctEmoji, correctEmoji];
+
+        // Добавляем 6 разных неправильных эмодзи
+        let added = 0;
+        while (added < 6) {
+            const randomEmoji = allEmojis[Math.floor(Math.random() * allEmojis.length)];
+            if (randomEmoji !== correctEmoji && !options.includes(randomEmoji)) {
+                options.push(randomEmoji);
+                added++;
+            }
+        }
+
+        // Перемешиваем массив
+        for (let i = options.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [options[i], options[j]] = [options[j], options[i]];
+        }
+
+        // Создаем капчу
+        const captcha = captchaRepository.create({
+            userId,
+            question: `Найдите и нажмите на все одинаковые смайлики`,
+            answer: correctEmoji,
+            type: 'emoji',
+            options: options,
+            expiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 минут
+            solved: false,
+            attempts: 0
+        });
+
+        await captchaRepository.save(captcha);
+
+        // Отладочная информация
+        console.log(`🎯 Создана капча ID: ${captcha.id}`);
+        console.log(`🎯 Правильный эмодзи: ${correctEmoji}`);
+        console.log(`🎯 Все эмодзи: ${options.join(', ')}`);
+        console.log(`🎯 Позиции правильных: ${options.map((e, i) => e === correctEmoji ? i : -1).filter(i => i !== -1).join(', ')}`);
+
+        return captcha;
+    }
+
+    private async showEmojiCaptcha(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+
+            // Создаем простую капчу без сохранения в БД
+            const allEmojis = [
+                '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
+                '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚',
+                '😋', '😛', '😜', '🤪', '😝', '🤑', '🤗', '🤭', '🤫', '🤔',
+                '🤐', '🤨', '😐', '😑', '😶', '😏', '😒', '🙄', '😬', '🤥',
+                '😌', '😔', '😪', '🤤', '😴', '😷', '🤒', '🤕', '🤢', '🤮',
+                '🤧', '🥵', '🥶', '🥴', '😵', '🤯', '🤠', '🥳', '😎', '🤓',
+                '🧐', '😕', '😟', '🙁', '😮', '😯', '😲', '😳', '🥺', '😦',
+                '😧', '😨', '😰', '😥', '😢', '😭', '😱', '😖', '😣', '😞',
+                '😓', '😩', '😫', '🥱', '😤', '😡', '😠', '🤬', '😈', '👿',
+                '💀', '☠️', '💩', '🤡', '👹', '👺', '👻', '👽', '👾', '🤖',
+                '😺', '😸', '😹', '😻', '😼', '😽', '🙀', '😿', '😾'
+            ];
+
+            // Выбираем случайный эмодзи как правильный ответ
+            const correctEmoji = allEmojis[Math.floor(Math.random() * allEmojis.length)];
+
+            // Создаем список из 9 эмодзи (3 правильных + 6 неправильных)
+            const options: string[] = [correctEmoji, correctEmoji, correctEmoji];
+
+            // Добавляем 6 разных неправильных эмодзи
+            let added = 0;
+            while (added < 6) {
+                const randomEmoji = allEmojis[Math.floor(Math.random() * allEmojis.length)];
+                if (randomEmoji !== correctEmoji && !options.includes(randomEmoji)) {
+                    options.push(randomEmoji);
+                    added++;
+                }
+            }
+
+            // Перемешиваем массив
+            for (let i = options.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [options[i], options[j]] = [options[j], options[i]];
+            }
+
+            // Генерируем ID капчи
+            const captchaId = Date.now();
+
+            // Сохраняем в памяти
+            this.captchaStore.set(captchaId, {
+                correctEmoji,
+                options,
+                selected: [],
+                attempts: 0,
+                userId: user.telegramId
+            });
+
+            console.log(`🎯 Создана капча в памяти: ID=${captchaId}, Правильный эмодзи=${correctEmoji}`);
+            console.log(`🎯 Правильные позиции: ${options.map((e, i) => e === correctEmoji ? i : -1).filter(i => i !== -1).join(', ')}`);
+
+            // Создаем кнопки 3x3
+            const buttons = [];
+
+            for (let i = 0; i < 9; i += 3) {
+                const row = [];
+                for (let j = 0; j < 3; j++) {
+                    const index = i + j;
+                    if (index < options.length) {
+                        row.push(
+                            Markup.button.callback(
+                                options[index],
+                                `captcha_emoji_${captchaId}_${index}`
+                            )
+                        );
+                    }
+                }
+                buttons.push(row);
+            }
+
+            // Добавляем кнопки управления
+            buttons.push([
+                Markup.button.callback('🔄 Новая капча', `refresh_captcha_${captchaId}`),
+                Markup.button.callback('❌ Отмена', 'cancel_captcha')
+            ]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            const message = `🎮 *Проверка безопасности*\n\n` +
+                `Найдите и нажмите на *ВСЕ одинаковые* смайлики\n` +
+                `Вам нужно найти *3 одинаковых* смайлика из 9\n\n` +
+                `⚠️ *Правила:*\n` +
+                `• Нажмите на все 3 одинаковых смайлика\n` +
+                `• У вас есть 3 попытки\n` +
+                `• Капча действует 5 минут\n\n` +
+                `💰 *Награда:* 10 звезд за успешное прохождение`;
+
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                ...keyboard
+            });
+
+        } catch (error) {
+            console.error('❌ Error showing emoji captcha:', error);
+            await ctx.reply('❌ Ошибка загрузки капчи. Попробуйте еще раз.');
+        }
+    }
+
+    private async handleEmojiCaptchaSelection(ctx: BotContext, captchaId: number, selectedIndex: number): Promise<void> {
+        try {
+            const user = ctx.user!;
+            const captchaData = this.captchaStore.get(captchaId);
+
+            if (!captchaData || captchaData.userId !== user.telegramId) {
+                await ctx.answerCbQuery('❌ Капча устарела');
+                return;
+            }
+
+            const { correctEmoji, options, selected, attempts } = captchaData;
+            const selectedEmoji = options[selectedIndex];
+
+            if (selected.includes(selectedIndex)) {
+                await ctx.answerCbQuery('⚠️ Этот смайлик уже выбран');
+                return;
+            }
+
+            // Проверяем правильность выбора
+            if (selectedEmoji === correctEmoji) {
+                // Правильный выбор
+                selected.push(selectedIndex);
+
+                // Проверяем, выбраны ли все 3 правильных смайлика
+                const correctCount = options.filter(emoji => emoji === correctEmoji).length;
+
+                console.log(`✅ Правильный выбор! Правильных эмодзи: ${selected.length}/${correctCount}`);
+
+                if (selected.length === correctCount) {
+                    // Все правильные выбраны!
+                    this.captchaStore.delete(captchaId);
+
+                    await ctx.answerCbQuery('🎉 Капча решена! Начисляем звезды...');
+
+                    // Удаляем сообщение с капчей
+                    try {
+                        if (ctx.callbackQuery?.message) {
+                            await ctx.deleteMessage();
+                        }
+                    } catch (e) {
+                        // Игнорируем ошибку удаления
+                    }
+
+                    // Завершаем регистрацию
+                    await this.completeRegistrationWithCaptcha(ctx);
+                    return;
+                } else {
+                    // Обновляем хранилище
+                    this.captchaStore.set(captchaId, { ...captchaData, selected });
+                    await ctx.answerCbQuery(`✅ Правильно! Осталось: ${correctCount - selected.length}`);
+                }
+            } else {
+                // Неправильный выбор
+                const newAttempts = attempts + 1;
+
+                if (newAttempts >= 3) {
+                    this.captchaStore.delete(captchaId);
+
+                    await ctx.answerCbQuery('❌ Слишком много ошибок! Попробуйте новую капчу');
+
+                    // Удаляем старое сообщение и показываем новую капчу
+                    try {
+                        if (ctx.callbackQuery?.message) {
+                            await ctx.deleteMessage();
+                        }
+                    } catch (e) {
+                        // Игнорируем ошибку удаления
+                    }
+
+                    await this.showEmojiCaptcha(ctx);
+                    return;
+                } else {
+                    // Обновляем хранилище
+                    this.captchaStore.set(captchaId, { ...captchaData, attempts: newAttempts });
+                    await ctx.answerCbQuery(`❌ Неправильно! Попыток осталось: ${3 - newAttempts}`);
+                }
+            }
+
+        } catch (error) {
+            console.error('❌ Error handling emoji captcha:', error);
+            await ctx.answerCbQuery('❌ Ошибка обработки капчи');
+        }
+    }
+    private async completeRegistrationWithCaptcha(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+            const userRepository = AppDataSource.getRepository(User);
+
+            // Начисляем звезды за успешную капчу
+            user.stars += 10; // 10 звезд за капчу
+            user.totalEarned += 10;
+            user.completedInitialSetup = true;
+
+            await userRepository.save(user);
+
+            // Обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.googleSheets.updateUserInSheets(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы:', sheetError);
+                }
+            }
+
+            // Реферальный бонус (если есть реферер)
+            if (user.referrerId) {
+                const referrerRepository = AppDataSource.getRepository(User);
+                const referrer = await referrerRepository.findOne({
+                    where: { id: user.referrerId }
+                });
+
+                if (referrer) {
+                    // Начисляем бонус рефереру
+                    referrer.stars += 3;
+                    referrer.referralsCount = (referrer.referralsCount || 0) + 1;
+                    referrer.totalEarned += 3;
+
+                    await referrerRepository.save(referrer);
+
+                    // Обновляем реферера в Google Sheets
+                    if (this.googleSheets) {
+                        try {
+                            await this.googleSheets.updateUserInSheets(referrer);
+                        } catch (sheetError) {
+                            console.error('❌ Ошибка обновления реферера в таблице:', sheetError);
+                        }
+                    }
+
+                    // Уведомляем реферера
+                    try {
+                        await this.bot.telegram.sendMessage(
+                            referrer.telegramId,
+                            `🎉 *По вашей ссылке зарегистрировался новый пользователь!*\n\n` +
+                            `✅ Вам начислено: +3 ⭐\n` +
+                            `👤 Приглашенный: ${user.firstName || 'Новый пользователь'}\n` +
+                            `📊 Ваш баланс: ${referrer.stars} ⭐\n` +
+                            `👥 Всего приглашено: ${referrer.referralsCount} друзей`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    } catch (error) {
+                        console.error(`❌ Ошибка уведомления реферера:`, error);
+                    }
+                }
+            }
+
+            // Отправляем сообщение об успехе
+            let successMessage = `🎉 *Регистрация завершена!*\n\n` +
+                `✅ Вы успешно прошли проверку безопасности\n` +
+                `💰 Начислено: 10 звезд\n`;
+
+            if (user.referrerId) {
+                successMessage += `🎁 *Реферальный бонус:*\n` +
+                    `• Вы получили: 10 ⭐\n` +
+                    `• Пригласивший получил: 3 ⭐\n\n`;
+            }
+
+            successMessage += `📊 Баланс: ${user.stars} ⭐\n\n` +
+                `🎮 Теперь вы можете играть и зарабатывать!`;
+
+            // Отправляем новое сообщение
+            await ctx.reply(successMessage, { parse_mode: 'Markdown' });
+
+            // Показываем главное меню через 2 секунды
+            setTimeout(async () => {
+                await this.showMainMenu(ctx);
+            }, 2000);
+
+        } catch (error) {
+            console.error('❌ Error completing registration with captcha:', error);
+            await ctx.reply('❌ Ошибка завершения регистрации.');
+        }
+    }
 
     private async showAdminPanel(ctx: BotContext) {
         const keyboard = Markup.keyboard([
@@ -2565,6 +3027,8 @@ class StarBot {
     }
 
     private setupAdminHandlers() {
+        // ============ СУЩЕСТВУЮЩИЙ КОД (не удаляем) ============
+
         // Статистика
         this.bot.hears('📊 Статистика', async (ctx) => {
             const userRepo = AppDataSource.getRepository(User);
@@ -2586,7 +3050,82 @@ class StarBot {
                 `⏳ Заявок на вывод: ${pendingWithdrawals}`
             );
         });
+        this.bot.command('sync_user', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав');
+                return;
+            }
 
+            const args = ctx.message.text.split(' ');
+            if (args.length !== 2) {
+                await ctx.reply('Использование: /sync_user <telegramId>\nПример: /sync_user 935888279');
+                return;
+            }
+
+            const telegramId = parseInt(args[1]);
+            if (isNaN(telegramId)) {
+                await ctx.reply('Ошибка: telegramId должен быть числом');
+                return;
+            }
+
+            try {
+                await ctx.reply(`🔄 Синхронизирую пользователя ${telegramId} из Google Sheets...`);
+
+                // Ищем пользователя в Sheets
+                const response = await this.googleSheets.sheets.spreadsheets.values.get({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID!,
+                    range: 'Пользователи!A2:H',
+                });
+
+                const rows = response.data.values || [];
+                const userRepository = AppDataSource.getRepository(User);
+
+                for (const row of rows) {
+                    const [, telegramIdStr, , , starsStr, , , status] = row;
+
+                    if (parseInt(telegramIdStr) === telegramId) {
+                        const user = await userRepository.findOne({
+                            where: { telegramId: telegramId }
+                        });
+
+                        if (user) {
+                            const stars = parseInt(starsStr) || 0;
+                            user.stars = stars;
+                            user.status = status || 'active';
+                            user.updatedAt = new Date();
+
+                            await userRepository.save(user);
+
+                            await ctx.reply(
+                                `✅ Пользователь ${telegramId} синхронизирован\n` +
+                                `💰 Новый баланс: ${stars} звезд\n` +
+                                `📊 Статус: ${status}`
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                await ctx.reply(`❌ Пользователь ${telegramId} не найден в Google Sheets`);
+
+            } catch (error: any) {
+                await ctx.reply(`❌ Ошибка: ${error.message}`);
+            }
+        });
+        this.bot.command('debug_sheet', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                await ctx.reply('🔍 Проверяю структуру таблицы...');
+                await this.googleSheets.debugSheetStructure();
+                await ctx.reply('✅ Проверка завершена. Смотрите логи консоли.');
+            } catch (error: any) {
+                await ctx.reply(`❌ Ошибка: ${error.message}`);
+            }
+        });
         // Рассылка
         this.bot.hears('📢 Рассылка', async (ctx) => {
             await ctx.reply(
@@ -2692,6 +3231,299 @@ class StarBot {
         // Главное меню
         this.bot.hears('↩️ Главное меню', async (ctx) => {
             await this.showMainMenu(ctx);
+        });
+
+        // ============ НОВЫЕ КОМАНДЫ ДЛЯ СИНХРОНИЗАЦИИ ============
+
+        // Команда для синхронизации из Sheets в БД
+        this.bot.command('sync_from_sheets', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                await ctx.reply('🔄 Запускаю синхронизацию данных ИЗ Google Sheets В БД...');
+
+                const result = await this.googleSheets.forceSyncFromSheets();
+
+                const report = `
+📊 *ОТЧЕТ СИНХРОНИЗАЦИИ Sheets → БД*
+
+✅ *Статус:* ${result.success ? 'Успешно' : 'С ошибками'}
+📝 *Сообщение:* ${result.message}
+
+📈 *Детали:*
+• 👥 Пользователей обновлено: ${result.details.usersUpdated}
+• 💰 Выплат обновлено: ${result.details.withdrawalsUpdated}
+• ❌ Ошибок: ${result.details.errors}
+
+${result.success ? '🎉 Все данные успешно синхронизированы!' : '⚠️ Рекомендуется проверить логи'}
+`;
+
+                await ctx.reply(report, { parse_mode: 'Markdown' });
+
+            } catch (error: any) {
+                console.error('❌ Ошибка выполнения команды sync_from_sheets:', error);
+                await ctx.reply(`❌ Ошибка при синхронизации: ${error.message}`);
+            }
+        });
+
+        // Команда для принудительной синхронизации с подтверждением
+        this.bot.command('sync_sheets_force', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '✅ Да, синхронизировать', callback_data: 'confirm_sync_sheets' },
+                        { text: '❌ Отмена', callback_data: 'cancel_sync_sheets' }
+                    ]
+                ]
+            };
+
+            await ctx.reply(
+                `⚠️ *ВНИМАНИЕ: ПРИНУДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ*\n\n` +
+                `Эта команда перезапишет данные в БД данными из Google Sheets.\n\n` +
+                `• 👥 Обновит данные пользователей\n` +
+                `• 💰 Обновит статусы выплат\n` +
+                `• 💎 Синхронизирует балансы\n\n` +
+                `Вы уверены, что хотите продолжить?`,
+                { parse_mode: 'Markdown', reply_markup: keyboard }
+            );
+        });
+
+        // Команда для проверки статуса синхронизации
+        this.bot.command('sync_status', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                const userRepository = AppDataSource.getRepository(User);
+                const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
+
+                const totalUsers = await userRepository.count();
+                const totalWithdrawals = await withdrawalRepository.count();
+
+                let sheetsUsers = 0;
+                let sheetsWithdrawals = 0;
+
+                try {
+                    const usersResponse = await this.googleSheets.sheets.spreadsheets.values.get({
+                        spreadsheetId: process.env.GOOGLE_SHEET_ID!,
+                        range: 'Пользователи!A2:A',
+                    });
+                    sheetsUsers = usersResponse.data.values?.length || 0;
+
+                    const withdrawalsResponse = await this.googleSheets.sheets.spreadsheets.values.get({
+                        spreadsheetId: process.env.GOOGLE_SHEET_ID!,
+                        range: 'Выплаты!A2:A',
+                    });
+                    sheetsWithdrawals = withdrawalsResponse.data.values?.length || 0;
+                } catch (error) {
+                    console.error('Ошибка получения данных из Sheets:', error);
+                }
+
+                const diffUsers = Math.abs(sheetsUsers - totalUsers);
+                const diffWithdrawals = Math.abs(sheetsWithdrawals - totalWithdrawals);
+
+                const statusMessage = `
+📊 *СТАТУС СИНХРОНИЗАЦИИ*
+
+*База данных:*
+• 👥 Пользователей: ${totalUsers}
+• 💰 Выплат: ${totalWithdrawals}
+
+*Google Sheets:*
+• 👥 Пользователей: ${sheetsUsers}
+• 💰 Выплат: ${sheetsWithdrawals}
+
+*Расхождения:*
+• 👥 Пользователи: ${diffUsers > 0 ? `⚠️ ${diffUsers}` : '✅ Нет'}
+• 💰 Выплаты: ${diffWithdrawals > 0 ? `⚠️ ${diffWithdrawals}` : '✅ Нет'}
+
+*Команды для синхронизации:*
+• /sync_from_sheets - Sheets → БД (из таблицы в базу)
+• /sync_sheets - БД → Sheets (из базы в таблицу)
+• /sync_sheets_force - Принудительная синхронизация с подтверждением
+`;
+
+                await ctx.reply(statusMessage, { parse_mode: 'Markdown' });
+
+            } catch (error: any) {
+                await ctx.reply(`❌ Ошибка получения статуса: ${error.message}`);
+            }
+        });
+
+        // Команда для просмотра справки по админ командам
+        this.bot.command('admin_help', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            // Используем HTML разметку, она более надежная
+            const helpMessage = `
+<b>👑 АДМИН ПАНЕЛЬ - КОМАНДЫ</b>
+
+<b>Синхронизация с Google Sheets:</b>
+• /sync_from_sheets - Синхронизировать данные ИЗ Sheets В БД
+• /sync_sheets - Синхронизировать данные ИЗ БД В Sheets
+• /sync_sheets_force - Принудительная синхронизация (с подтверждением)
+• /sync_status - Показать статус синхронизации
+
+<b>Управление таблицами:</b>
+• /fix_sheet - Исправить таблицу выплат
+• /sheet - Открыть Google Sheets
+• /sync_all - Полная синхронизация
+
+<b>Админ меню (кнопки):</b>
+• 📊 Статистика - Общая статистика бота
+• 📢 Рассылка - Рассылка сообщений пользователям
+• 📋 Заявки на вывод - Список pending заявок
+• 👥 Топ пользователей - Топ-10 по звездам
+• ↩️ Главное меню - Вернуться в меню
+
+<b>Рассылка сообщений:</b>
+• /broadcast - Отправить сообщение всем пользователям
+• /broadcast_test - Тестовая рассылка (только админу)
+
+<b>Просмотр данных:</b>
+• /users - Список пользователей
+• /withdrawals - Список выплат
+• /stats - Статистика бота
+• /check_ref - Проверка реферальной системы
+
+<b>Управление пользователями:</b>
+• /find_user &lt;id/username&gt; - Найти пользователя
+• /user_stats &lt;id&gt; - Статистика пользователя
+• /update_balance &lt;id&gt; &lt;amount&gt; - Обновить баланс
+
+<code>⚠️ Важно:</code>
+• /sync_from_sheets - обновляет БД данными из Sheets
+• /sync_sheets - обновляет Sheets данными из БД
+• В случае рассинхронизации используйте /sync_status для диагностики
+`;
+
+            await ctx.reply(helpMessage, { parse_mode: 'HTML' });
+        });
+
+        // Обновляем существующую команду /sync_sheets для ясности
+        this.bot.command('sync_sheets', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🔄 БД → Sheets', callback_data: 'sync_db_to_sheets' },
+                        { text: '🔄 Sheets → БД', callback_data: 'sync_sheets_to_db' }
+                    ],
+                    [
+                        { text: '📊 Статус', callback_data: 'sync_status_action' }
+                    ]
+                ]
+            };
+
+            await ctx.reply(
+                '📊 *Выберите направление синхронизации:*\n\n' +
+                '• *БД → Sheets*: Обновить Google Sheets данными из базы\n' +
+                '• *Sheets → БД*: Обновить базу данных данными из Google Sheets',
+                { parse_mode: 'Markdown', reply_markup: keyboard }
+            );
+        });
+
+        // ============ ОБРАБОТЧИКИ КНОПОК ДЛЯ СИНХРОНИЗАЦИИ ============
+
+        // Обработчик кнопки подтверждения синхронизации
+        this.bot.action('confirm_sync_sheets', async (ctx) => {
+            try {
+                const userId = ctx.from?.id;
+                if (!userId || !this.isAdmin(userId)) {
+                    await ctx.answerCbQuery('⛔ У вас нет прав');
+                    return;
+                }
+
+                await ctx.editMessageText('🔄 Синхронизация запущена...');
+
+                const result = await this.googleSheets.forceSyncFromSheets();
+
+                await ctx.editMessageText(
+                    `📊 *РЕЗУЛЬТАТ СИНХРОНИЗАЦИИ*\n\n` +
+                    `${result.message}\n\n` +
+                    `👥 Пользователей: ${result.details.usersUpdated}\n` +
+                    `💰 Выплат: ${result.details.withdrawalsUpdated}\n` +
+                    `❌ Ошибок: ${result.details.errors}`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error: any) {
+                await ctx.editMessageText(`❌ Ошибка: ${error.message}`);
+            }
+        });
+
+        // Обработчик отмены синхронизации
+        this.bot.action('cancel_sync_sheets', async (ctx) => {
+            await ctx.editMessageText('❌ Синхронизация отменена');
+        });
+
+        // Обработчики кнопок для выбора направления синхронизации
+        this.bot.action('sync_db_to_sheets', async (ctx) => {
+            try {
+                await ctx.answerCbQuery('🔄 Синхронизация БД → Sheets...');
+                await this.googleSheets.fullSyncToSheets();
+                await ctx.answerCbQuery('✅ Синхронизировано БД → Sheets');
+                await ctx.editMessageText('✅ Google Sheets обновлена данными из БД');
+            } catch (error: any) {
+                await ctx.answerCbQuery('❌ Ошибка');
+                await ctx.editMessageText(`❌ Ошибка синхронизации: ${error.message}`);
+            }
+        });
+
+        this.bot.action('sync_sheets_to_db', async (ctx) => {
+            try {
+                await ctx.answerCbQuery('🔄 Синхронизация Sheets → БД...');
+                const result = await this.googleSheets.forceSyncFromSheets();
+                await ctx.answerCbQuery('✅ Синхронизировано Sheets → БД');
+
+                await ctx.editMessageText(
+                    `✅ Данные из Google Sheets синхронизированы в БД\n\n` +
+                    `👥 Пользователей: ${result.details.usersUpdated}\n` +
+                    `💰 Выплат: ${result.details.withdrawalsUpdated}\n` +
+                    `❌ Ошибок: ${result.details.errors}`
+                );
+            } catch (error: any) {
+                await ctx.answerCbQuery('❌ Ошибка');
+                await ctx.editMessageText(`❌ Ошибка синхронизации: ${error.message}`);
+            }
+        });
+
+        this.bot.action('sync_status_action', async (ctx) => {
+            await ctx.answerCbQuery('📊 Получаю статус...');
+
+            try {
+                const userRepository = AppDataSource.getRepository(User);
+                const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
+
+                const totalUsers = await userRepository.count();
+                const totalWithdrawals = await withdrawalRepository.count();
+
+                await ctx.editMessageText(
+                    `📊 *Текущий статус БД:*\n\n` +
+                    `👥 Пользователей: ${totalUsers}\n` +
+                    `💰 Выплат: ${totalWithdrawals}\n\n` +
+                    `Используйте /sync_status для детального отчета`
+                );
+            } catch (error) {
+                await ctx.editMessageText('❌ Ошибка получения статуса');
+            }
         });
     }
 

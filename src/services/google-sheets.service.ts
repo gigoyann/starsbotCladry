@@ -16,7 +16,7 @@ interface BotNotificationInterface {
 
 export class GoogleSheetsService {
     private auth: JWT;
-    private sheets: any;
+    public sheets: any;
     private spreadsheetId: string;
 
     constructor() {
@@ -77,6 +77,7 @@ export class GoogleSheetsService {
             return false;
         }
     }
+
     async syncNewWithdrawalsOnly() {
         try {
             const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
@@ -927,6 +928,290 @@ export class GoogleSheetsService {
             throw error;
         }
     }
+
+    public async updateUserInSheets(user: User): Promise<void> {
+        try {
+            console.log(`🔄 Обновляю пользователя ${user.telegramId} в Google Sheets...`);
+
+            const rowData = this.formatUserRow(user);
+
+            // Используем русское название листа
+            const sheetName = 'Пользователи';
+            const fullRange = `${sheetName}!A:K`;
+
+            try {
+                // Пытаемся получить данные
+                const response = await this.sheets.spreadsheets.values.get({
+                    spreadsheetId: this.spreadsheetId,
+                    range: fullRange,
+                });
+
+                const rows = response.data.values || [];
+
+                if (!rows || rows.length === 0) {
+                    // Если таблица полностью пустая
+                    console.log(`📄 Таблица ${sheetName} пустая, создаю заголовки и добавляю пользователя...`);
+
+                    // Сначала добавляем заголовки если их нет
+                    const headers = [
+                        ['ID', 'Telegram ID', 'Username', 'Имя', 'Фамилия',
+                            'Звезды', 'Всего заработано', 'Последнее обновление', 'Статус',
+                            'Настройка завершена', 'Подписан на каналы']
+                    ];
+
+                    await this.sheets.spreadsheets.values.update({
+                        spreadsheetId: this.spreadsheetId,
+                        range: `${sheetName}!A1:K1`,
+                        valueInputOption: 'RAW',
+                        requestBody: { values: headers }
+                    });
+
+                    // Затем добавляем пользователя
+                    await this.sheets.spreadsheets.values.append({
+                        spreadsheetId: this.spreadsheetId,
+                        range: fullRange,
+                        valueInputOption: 'RAW',
+                        insertDataOption: 'INSERT_ROWS',
+                        requestBody: { values: [rowData] }
+                    });
+
+                    console.log(`✅ Пользователь ${user.telegramId} добавлен с заголовками таблицы`);
+                    return;
+                }
+
+                // Проверяем есть ли заголовки
+                const hasHeaders = rows.length > 0;
+                const startRow = hasHeaders ? 1 : 0;
+
+                let rowIndex = -1;
+                for (let i = startRow; i < rows.length; i++) {
+                    if (rows[i] && rows[i][0] && rows[i][0].toString() === user.id.toString()) {
+                        rowIndex = i + 1;
+                        break;
+                    }
+                }
+
+                if (rowIndex > 0) {
+                    // Обновляем существующую строку
+                    const updateRange = `${sheetName}!A${rowIndex}:K${rowIndex}`;
+                    await this.sheets.spreadsheets.values.update({
+                        spreadsheetId: this.spreadsheetId,
+                        range: updateRange,
+                        valueInputOption: 'RAW',
+                        requestBody: { values: [rowData] }
+                    });
+                    console.log(`✅ Пользователь ${user.telegramId} обновлен в строке ${rowIndex}`);
+                } else {
+                    // Добавляем нового пользователя
+                    await this.sheets.spreadsheets.values.append({
+                        spreadsheetId: this.spreadsheetId,
+                        range: fullRange,
+                        valueInputOption: 'RAW',
+                        insertDataOption: 'INSERT_ROWS',
+                        requestBody: { values: [rowData] }
+                    });
+                    console.log(`✅ Пользователь ${user.telegramId} добавлен как новая строка`);
+                }
+
+            } catch (sheetError: any) {
+                console.error(`❌ Ошибка работы с таблицей ${sheetName} для ${user.telegramId}:`, sheetError.message);
+
+                // Если лист не существует, создаем его
+                if (sheetError.message && sheetError.message.includes('Unable to parse range')) {
+                    console.log(`🛠️ Лист "${sheetName}" не найден, создаю новый...`);
+
+                    try {
+                        // Создаем новый лист через API
+                        const createSheetResponse = await this.sheets.spreadsheets.batchUpdate({
+                            spreadsheetId: this.spreadsheetId,
+                            requestBody: {
+                                requests: [{
+                                    addSheet: {
+                                        properties: {
+                                            title: sheetName,
+                                            gridProperties: {
+                                                rowCount: 100,
+                                                columnCount: 11
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        });
+
+                        // Ждем создания листа
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+
+                        // Добавляем заголовки и первого пользователя
+                        const headersAndData = [
+                            ['ID', 'Telegram ID', 'Username', 'Имя', 'Фамилия',
+                                'Звезды', 'Всего заработано', 'Последнее обновление', 'Статус',
+                                'Настройка завершена', 'Подписан на каналы'],
+                            rowData
+                        ];
+
+                        await this.sheets.spreadsheets.values.update({
+                            spreadsheetId: this.spreadsheetId,
+                            range: `${sheetName}!A1:K2`,
+                            valueInputOption: 'RAW',
+                            requestBody: { values: headersAndData }
+                        });
+
+                        console.log(`✅ Лист "${sheetName}" создан, пользователь ${user.telegramId} добавлен`);
+                    } catch (createError: any) {
+                        console.error(`❌ Не удалось создать лист "${sheetName}":`, createError.message);
+                        this.saveDeferredUpdate(user);
+                    }
+                } else {
+                    console.error(`❌ Другая ошибка:`, sheetError);
+                    this.saveDeferredUpdate(user);
+                }
+            }
+
+        } catch (error: any) {
+            console.error(`❌ Критическая ошибка обновления пользователя ${user.telegramId}:`, error.message);
+            this.saveDeferredUpdate(user);
+        }
+    }
+
+
+    // Дополнительный метод для отложенных обновлений
+    private saveDeferredUpdate(user: User): void {
+        console.log(`✅ Отложенное обновление для пользователя ${user.telegramId}`);
+        // Здесь можно сохранить в очередь или кеш для повторной попытки позже
+    }
+
+    private formatUserRow(user: User): any[] {
+    // Под вашу структуру:
+    // A: ID из БД (оставляем пустым или user.id)
+    // B: Telegram ID
+    // C: Имя
+    // D: Username
+    // E: Баланс
+    // F: Приглашено
+    // G: Регистрация
+    // H: Статус
+    
+    return [
+        user.id || '',                   // A: ID из БД
+        user.telegramId,                // B: Telegram ID
+        user.firstName || '',           // C: Имя
+        user.username || '',            // D: Username
+        user.stars,                     // E: Баланс
+        user.referralsCount || 0,       // F: Приглашено
+        user.createdAt ? user.createdAt.toISOString() : new Date().toISOString(), // G: Регистрация
+        user.status || 'active'         // H: Статус
+    ];
+}
+
+    public async updateUserBalanceInSheets(telegramId: number, balance: number): Promise<boolean> {
+        try {
+            // Исправляем название листа на русское
+            const sheetName = 'Пользователи';
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: `${sheetName}!B2:F1000`, // B - Telegram ID, F - Баланс
+            });
+
+            const rows = response.data.values || [];
+            let rowIndex = -1;
+
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                if (row.length > 0) {
+                    const id = parseInt(row[0]);
+                    if (id === telegramId) {
+                        rowIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (rowIndex === -1) {
+                console.log(`⚠️ Пользователь ${telegramId} не найден для обновления баланса`);
+                return false;
+            }
+
+            const sheetRow = rowIndex + 2;
+
+            await this.sheets.spreadsheets.values.update({
+                spreadsheetId: this.spreadsheetId,
+                range: `${sheetName}!F${sheetRow}`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: {
+                    values: [[balance]]
+                }
+            });
+
+            console.log(`✅ Баланс пользователя ${telegramId} обновлен: ${balance} ⭐`);
+            return true;
+
+        } catch (error) {
+            console.error(`❌ Ошибка обновления баланса ${telegramId}:`, error);
+            return false;
+        }
+    }
+
+
+    public async syncNewUsersOnly(): Promise<number> {
+        try {
+            // Получаем пользователей которых еще нет в таблице
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Users!B2:B1000', // Только Telegram ID
+            });
+
+            const existingIds = new Set<number>();
+            const rows = response.data.values || [];
+
+            for (const row of rows) {
+                if (row.length > 0) {
+                    const id = parseInt(row[0]);
+                    if (!isNaN(id)) {
+                        existingIds.add(id);
+                    }
+                }
+            }
+
+            // Находим новых пользователей
+            const userRepository = AppDataSource.getRepository(User);
+            const allUsers = await userRepository.find();
+
+            let newCount = 0;
+            for (const user of allUsers) {
+                if (!existingIds.has(user.telegramId)) {
+                    await this.syncUser(user);
+                    newCount++;
+                }
+            }
+
+            if (newCount > 0) {
+                console.log(`✅ Добавлено ${newCount} новых пользователей в таблицу`);
+            }
+
+            return newCount;
+        } catch (error) {
+            console.error('❌ Ошибка синхронизации новых пользователей:', error);
+            return 0;
+        }
+    }
+
+    public async fullSyncToSheets(): Promise<void> {
+        try {
+            console.log('🔄 Полная односторонняя синхронизация (БД → Google Sheets)...');
+
+            // 1. Синхронизируем всех пользователей
+            await this.syncAllUsersWithoutOverwrite();
+
+            // 2. Синхронизируем все выплаты
+            await this.syncAllWithdrawals();
+
+            console.log('✅ Полная синхронизация завершена');
+        } catch (error) {
+            console.error('❌ Ошибка полной синхронизации:', error);
+            throw error;
+        }
+    }
     // ============ ЛИСТ 3: РЕФЕРАЛЫ ============
     async syncReferralSystem() {
         try {
@@ -1036,25 +1321,26 @@ export class GoogleSheetsService {
     }
     // Метод для нормализации статуса пользователя
     private normalizeUserStatus(status: string): 'active' | 'blocked' | 'pending' | null {
-        if (!status) return null;
+    if (!status) return null;
 
-        const statusLower = status.toLowerCase().trim();
+    const statusLower = status.toLowerCase().trim();
 
-        if (statusLower === 'active' || statusLower === 'активен' || statusLower === 'активный') {
-            return 'active';
-        }
-
-        if (statusLower === 'blocked' || statusLower === 'заблокирован' || statusLower === 'заблокирован') {
-            return 'blocked';
-        }
-
-        if (statusLower === 'pending' || statusLower === 'ожидание' || statusLower === 'в ожидании') {
-            return 'pending';
-        }
-
-        console.log(`⚠️ Неизвестный статус пользователя: "${status}"`);
-        return null;
+    if (statusLower === 'active' || statusLower === 'активен' || statusLower === 'активный') {
+        return 'active';
     }
+
+    if (statusLower === 'blocked' || statusLower === 'заблокирован' || statusLower === 'заблокирован') {
+        return 'blocked';
+    }
+
+    if (statusLower === 'pending' || statusLower === 'ожидание' || statusLower === 'в ожидании') {
+        return 'pending';
+    }
+
+    // Если статус пустой или неизвестный - считаем active
+    console.log(`⚠️ Неизвестный статус пользователя: "${status}", устанавливаю "active"`);
+    return 'active';
+}
     public async setupAllFormatting() {
         try {
             await this.setupChipFormatting(); // Для статусов выплат
@@ -1327,111 +1613,111 @@ export class GoogleSheetsService {
         }
     }
 
-   // В методе notifyUserAboutWithdrawalStatusChange:
-private async notifyUserAboutWithdrawalStatusChange(
-    withdrawal: Withdrawal,
-    oldStatus: string,
-    newStatus: string,
-    adminComment: string = '',
-    amount: number,
-    username: string,
-    firstName: string
-) {
-    try {
-        // Получаем экземпляр бота из глобальной области
-        const botInstance = (global as any).botInstance;
-        if (!botInstance || !botInstance.bot || !botInstance.bot.telegram) {
-            console.error('❌ Bot instance not found or invalid for notification');
-            return;
-        }
-
-        // Находим пользователя по telegramId из withdrawal
-        const userRepository = AppDataSource.getRepository(User);
-        const user = await userRepository.findOne({ 
-            where: { telegramId: withdrawal.telegramId } 
-        });
-
-        if (!user) {
-            console.error(`❌ User not found for withdrawal #${withdrawal.id}, telegramId: ${withdrawal.telegramId}`);
-            return;
-        }
-
-        let message = '';
-        let keyboard = undefined;
-
-        if (newStatus === 'approved' || newStatus === 'completed') {
-            message =
-                `✅ *Заявка на вывод #${withdrawal.id} ОДОБРЕНА!*\n\n` +
-                `💰 Сумма: ${amount} ⭐\n` +
-                `📅 Дата обработки: ${new Date().toLocaleString('ru-RU')}\n` +
-                `👤 Обработано администратором\n\n`;
-            
-            if (adminComment && adminComment.trim() !== '') {
-                message += `💬 Комментарий администратора:\n${adminComment}\n\n`;
-            }
-            
-            message += `🎉 Средства будут переведены в ближайшее время.\n` +
-                      `📞 Для уточнений свяжитесь с поддержкой.`;
-
-        } else if (newStatus === 'rejected') {
-            message =
-                `❌ *Заявка на вывод #${withdrawal.id} ОТКЛОНЕНА!*\n\n` +
-                `💰 Сумма: ${amount} ⭐\n` +
-                `📅 Дата отказа: ${new Date().toLocaleString('ru-RU')}\n` +
-                `👤 Отклонено администратором\n\n`;
-            
-            if (adminComment && adminComment.trim() !== '') {
-                message += `💬 Причина отказа:\n${adminComment}\n\n`;
-            } else {
-                message += `💬 Причина отказа: не указана\n\n`;
-            }
-            
-            message += `💰 *Средства возвращены на ваш баланс!*\n` +
-                      `📊 Новый баланс: ${user.stars + amount} ⭐\n\n` +
-                      `⚠️ Вы можете создать новую заявку с правильными данными.`;
-            
-            // Возвращаем средства пользователю
-            user.stars += amount;
-            await userRepository.save(user);
-
-            keyboard = {
-                inline_keyboard: [[
-                    { text: '💰 Создать новую заявку', callback_data: 'withdraw' },
-                    { text: '🏠 В меню', callback_data: 'back_to_menu' }
-                ]]
-            };
-
-        } else if (newStatus === 'processing') {
-            message =
-                `🔄 *Заявка на вывод #${withdrawal.id} в обработке!*\n\n` +
-                `💰 Сумма: ${amount} ⭐\n` +
-                `⏳ Статус: Администратор проверяет заявку\n` +
-                `📅 Начало обработки: ${new Date().toLocaleString('ru-RU')}\n\n` +
-                `⏰ Обычно обработка занимает до 24 часов.\n` +
-                `📞 Для ускорения свяжитесь с администратором.`;
-        } else if (newStatus === 'pending') {
-            // Ничего не делаем, это начальный статус
-            return;
-        }
-
-        // Отправляем уведомление пользователю через бота
+    // В методе notifyUserAboutWithdrawalStatusChange:
+    private async notifyUserAboutWithdrawalStatusChange(
+        withdrawal: Withdrawal,
+        oldStatus: string,
+        newStatus: string,
+        adminComment: string = '',
+        amount: number,
+        username: string,
+        firstName: string
+    ) {
         try {
-            await botInstance.bot.telegram.sendMessage(user.telegramId, message, {
-                parse_mode: 'Markdown',
-                reply_markup: keyboard
+            // Получаем экземпляр бота из глобальной области
+            const botInstance = (global as any).botInstance;
+            if (!botInstance || !botInstance.bot || !botInstance.bot.telegram) {
+                console.error('❌ Bot instance not found or invalid for notification');
+                return;
+            }
+
+            // Находим пользователя по telegramId из withdrawal
+            const userRepository = AppDataSource.getRepository(User);
+            const user = await userRepository.findOne({
+                where: { telegramId: withdrawal.telegramId }
             });
-            console.log(`✅ User ${user.telegramId} notified about withdrawal #${withdrawal.id} status: ${oldStatus} → ${newStatus}`);
-        } catch (sendError: any) {
-            console.error(`❌ Error sending notification to user ${user.telegramId}:`, sendError.message);
+
+            if (!user) {
+                console.error(`❌ User not found for withdrawal #${withdrawal.id}, telegramId: ${withdrawal.telegramId}`);
+                return;
+            }
+
+            let message = '';
+            let keyboard = undefined;
+
+            if (newStatus === 'approved' || newStatus === 'completed') {
+                message =
+                    `✅ *Заявка на вывод #${withdrawal.id} ОДОБРЕНА!*\n\n` +
+                    `💰 Сумма: ${amount} ⭐\n` +
+                    `📅 Дата обработки: ${new Date().toLocaleString('ru-RU')}\n` +
+                    `👤 Обработано администратором\n\n`;
+
+                if (adminComment && adminComment.trim() !== '') {
+                    message += `💬 Комментарий администратора:\n${adminComment}\n\n`;
+                }
+
+                message += `🎉 Средства будут переведены в ближайшее время.\n` +
+                    `📞 Для уточнений свяжитесь с поддержкой.`;
+
+            } else if (newStatus === 'rejected') {
+                message =
+                    `❌ *Заявка на вывод #${withdrawal.id} ОТКЛОНЕНА!*\n\n` +
+                    `💰 Сумма: ${amount} ⭐\n` +
+                    `📅 Дата отказа: ${new Date().toLocaleString('ru-RU')}\n` +
+                    `👤 Отклонено администратором\n\n`;
+
+                if (adminComment && adminComment.trim() !== '') {
+                    message += `💬 Причина отказа:\n${adminComment}\n\n`;
+                } else {
+                    message += `💬 Причина отказа: не указана\n\n`;
+                }
+
+                message += `💰 *Средства возвращены на ваш баланс!*\n` +
+                    `📊 Новый баланс: ${user.stars + amount} ⭐\n\n` +
+                    `⚠️ Вы можете создать новую заявку с правильными данными.`;
+
+                // Возвращаем средства пользователю
+                user.stars += amount;
+                await userRepository.save(user);
+
+                keyboard = {
+                    inline_keyboard: [[
+                        { text: '💰 Создать новую заявку', callback_data: 'withdraw' },
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]]
+                };
+
+            } else if (newStatus === 'processing') {
+                message =
+                    `🔄 *Заявка на вывод #${withdrawal.id} в обработке!*\n\n` +
+                    `💰 Сумма: ${amount} ⭐\n` +
+                    `⏳ Статус: Администратор проверяет заявку\n` +
+                    `📅 Начало обработки: ${new Date().toLocaleString('ru-RU')}\n\n` +
+                    `⏰ Обычно обработка занимает до 24 часов.\n` +
+                    `📞 Для ускорения свяжитесь с администратором.`;
+            } else if (newStatus === 'pending') {
+                // Ничего не делаем, это начальный статус
+                return;
+            }
+
+            // Отправляем уведомление пользователю через бота
+            try {
+                await botInstance.bot.telegram.sendMessage(user.telegramId, message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+                console.log(`✅ User ${user.telegramId} notified about withdrawal #${withdrawal.id} status: ${oldStatus} → ${newStatus}`);
+            } catch (sendError: any) {
+                console.error(`❌ Error sending notification to user ${user.telegramId}:`, sendError.message);
+            }
+
+            // Обновляем колонку "Уведомление" в Google Sheets
+            await this.markAsNotified(withdrawal.id);
+
+        } catch (error: any) {
+            console.error(`❌ Error in notifyUserAboutWithdrawalStatusChange for withdrawal #${withdrawal.id}:`, error.message);
         }
-
-        // Обновляем колонку "Уведомление" в Google Sheets
-        await this.markAsNotified(withdrawal.id);
-
-    } catch (error: any) {
-        console.error(`❌ Error in notifyUserAboutWithdrawalStatusChange for withdrawal #${withdrawal.id}:`, error.message);
     }
-}
     // Метод для отметки в Google Sheets, что уведомление отправлено
     private async markAsNotified(withdrawalId: number) {
         try {
@@ -1554,40 +1840,420 @@ private async notifyUserAboutWithdrawalStatusChange(
     }
 
     // ============ УВЕДОМЛЕНИЯ ============
-    private async notifyUserAboutWithdrawalStatus(withdrawalId: number, status: string, comment?: string) {
+    public async syncFromSheetsToDB(): Promise<{
+        usersUpdated: number;
+        withdrawalsUpdated: number;
+        errors: number;
+    }> {
         try {
-            const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
+            console.log('🔄 СИНХРОНИЗАЦИЯ Sheets → БД...');
+
+            let usersUpdated = 0;
+            let withdrawalsUpdated = 0;
+            let errors = 0;
+
+            // 1. Синхронизация пользователей из Sheets в БД
+            try {
+                usersUpdated = await this.syncUsersFromSheets();
+                console.log(`✅ Пользователей обновлено: ${usersUpdated}`);
+            } catch (error: any) {
+                console.error('❌ Ошибка синхронизации пользователей:', error.message);
+                errors++;
+            }
+
+            // 2. Синхронизация выплат из Sheets в БД
+            try {
+                withdrawalsUpdated = await this.syncWithdrawalsFromSheets();
+                console.log(`✅ Выплат обновлено: ${withdrawalsUpdated}`);
+            } catch (error: any) {
+                console.error('❌ Ошибка синхронизации выплат:', error.message);
+                errors++;
+            }
+
+            // 3. Синхронизация балансов из Sheets в БД
+            try {
+                const balancesUpdated = await this.syncBalancesFromSheets();
+                console.log(`✅ Балансов обновлено: ${balancesUpdated}`);
+            } catch (error: any) {
+                console.error('❌ Ошибка синхронизации балансов:', error.message);
+                errors++;
+            }
+
+            console.log(`✅ Синхронизация Sheets → БД завершена. Обновлено: ${usersUpdated} пользователей, ${withdrawalsUpdated} выплат, ошибок: ${errors}`);
+
+            return { usersUpdated, withdrawalsUpdated, errors };
+        } catch (error: any) {
+            console.error('❌ Критическая ошибка синхронизации Sheets → БД:', error.message);
+            return { usersUpdated: 0, withdrawalsUpdated: 0, errors: 1 };
+        }
+    }
+    private async syncUsersFromSheets(): Promise<number> {
+        try {
+            console.log('📊 Чтение пользователей из Google Sheets...');
+
+            // Читаем все 8 колонок
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Пользователи!A2:H', // A-H: все колонки
+            });
+
+            const rows = response.data.values || [];
+            console.log(`📊 Найдено ${rows.length} пользователей в таблице`);
+
             const userRepository = AppDataSource.getRepository(User);
+            let updatedCount = 0;
 
-            const withdrawal = await withdrawalRepository.findOne({
-                where: { id: withdrawalId }
-            });
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                try {
+                    // Формат строки: [dbId, telegramId, firstName, username, stars, referralsCount, createdAt, status]
+                    const [
+                        dbIdStr,           // A: ID из БД (не используем)
+                        telegramIdStr,     // B: Telegram ID
+                        firstName,         // C: Имя
+                        username,          // D: Username
+                        starsStr,          // E: Баланс (звезды) ⭐
+                        referralsCountStr, // F: Приглашено
+                        createdAtStr,      // G: Регистрация
+                        status             // H: Статус
+                    ] = row;
 
-            if (!withdrawal) return;
+                    // Отладочный вывод для первых строк
+                    if (i < 3) {
+                        console.log(`🔍 Строка ${i + 2}: telegramId=${telegramIdStr}, username=${username}, баланс=${starsStr}, статус=${status}`);
+                    }
 
-            const user = await userRepository.findOne({
-                where: { id: withdrawal.userId }
-            });
+                    if (!telegramIdStr || !starsStr) {
+                        console.log(`⚠️ Пропускаем строку ${i + 2}: нет telegramId или баланса`);
+                        continue;
+                    }
 
-            if (!user) return;
+                    const userTelegramId = parseInt(telegramIdStr);
+                    const stars = parseInt(starsStr) || 0;
+                    const referralsCount = parseInt(referralsCountStr) || 0;
 
-            let message = '';
-            if (status === 'approved') {
-                message = `✅ Ваша заявка на вывод #${withdrawalId} одобрена!\n💰 Сумма: ${withdrawal.amount} ⭐`;
-            } else if (status === 'rejected') {
-                message = `❌ Ваша заявка на вывод #${withdrawalId} отклонена.\n💰 Сумма: ${withdrawal.amount} ⭐`;
-                if (comment && comment.trim() !== '') {
-                    message += `\n📝 Причина: ${comment}`;
+                    if (isNaN(userTelegramId)) {
+                        console.log(`⚠️ Пропускаем строку ${i + 2}: неверный telegramId "${telegramIdStr}"`);
+                        continue;
+                    }
+
+                    // Находим пользователя в БД по Telegram ID
+                    let user = await userRepository.findOne({
+                        where: { telegramId: userTelegramId }
+                    });
+
+                    if (!user) {
+                        // Пользователь не найден - создаем нового
+                        user = userRepository.create({
+                            telegramId: userTelegramId,
+                            username: username || '',
+                            firstName: firstName || '',
+                            stars: stars,
+                            referralsCount: referralsCount,
+                            status: this.normalizeUserStatus(status) || 'active',
+                            completedInitialSetup: true,
+                            createdAt: createdAtStr ? new Date(createdAtStr) : new Date(),
+                            updatedAt: new Date()
+                        });
+                        console.log(`➕ Создан новый пользователь: ${userTelegramId} (${username || 'без username'})`);
+                    } else {
+                        // Обновляем существующего пользователя
+                        const normalizedStatus = this.normalizeUserStatus(status);
+                        const hasChanges =
+                            user.stars !== stars ||
+                            user.referralsCount !== referralsCount ||
+                            (normalizedStatus && user.status !== normalizedStatus);
+
+                        if (hasChanges) {
+                            const oldStars = user.stars;
+                            const oldStatus = user.status;
+
+                            user.stars = stars;
+                            user.referralsCount = referralsCount;
+                            if (normalizedStatus) {
+                                user.status = normalizedStatus;
+                            }
+                            user.updatedAt = new Date();
+                            updatedCount++;
+
+                            console.log(`🔄 Обновлен пользователь ${userTelegramId}: ` +
+                                `баланс=${oldStars}→${stars}, ` +
+                                `рефералы=${user.referralsCount}, ` +
+                                `статус=${oldStatus}→${user.status}`);
+                        }
+                    }
+
+                    await userRepository.save(user);
+
+                } catch (rowError: any) {
+                    console.error(`❌ Ошибка обработки строки ${i + 2}:`, row);
+                    console.error(`❌ Детали ошибки:`, rowError.message);
                 }
             }
 
-            if (message) {
-                console.log(`📨 Уведомление для пользователя ${user.telegramId}: ${message}`);
-                // Здесь можно отправить сообщение пользователю через бота
-                // await this.bot.telegram.sendMessage(user.telegramId, message);
-            }
+            console.log(`✅ Пользователей обновлено: ${updatedCount}`);
+            return updatedCount;
         } catch (error: any) {
-            console.error('❌ Ошибка отправки уведомления:', error.message);
+            console.error('❌ Ошибка чтения пользователей из Sheets:', error.message);
+            throw error;
+        }
+    }
+    private async syncWithdrawalsFromSheets(): Promise<number> {
+        try {
+            console.log('📊 Чтение выплат из Google Sheets...');
+
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Выплаты!A2:I', // Читаем все колонки выплат
+            });
+
+            const rows = response.data.values || [];
+            console.log(`📊 Найдено ${rows.length} выплат в таблице`);
+
+            const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
+            const userRepository = AppDataSource.getRepository(User);
+            let updatedCount = 0;
+
+            for (const row of rows) {
+                try {
+                    // Формат: [id, telegramId, username, firstName, amount, status, createdAt, processedAt, notificationSent]
+                    const [id, telegramId, , , amountStr, status, createdAtStr, processedAtStr] = row;
+
+                    if (!id || !telegramId || !amountStr || !status) continue;
+
+                    const withdrawalId = parseInt(id);
+                    const userTelegramId = parseInt(telegramId);
+                    const amount = parseInt(amountStr);
+                    const normalizedStatus = this.normalizeStatus(status);
+
+                    if (isNaN(withdrawalId) || isNaN(userTelegramId) || isNaN(amount) || !normalizedStatus) continue;
+
+                    // Находим пользователя
+                    const user = await userRepository.findOne({
+                        where: { telegramId: userTelegramId }
+                    });
+
+                    if (!user) {
+                        console.error(`⚠️ Пользователь с telegramId ${userTelegramId} не найден для выплаты ${withdrawalId}`);
+                        continue;
+                    }
+
+                    // Находим выплату в БД
+                    let withdrawal = await withdrawalRepository.findOne({
+                        where: { id: withdrawalId }
+                    });
+
+                    // Парсим даты
+                    const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
+                    const processedAt = processedAtStr ? new Date(processedAtStr) : null; // null вместо undefined
+
+                    if (!withdrawal) {
+                        // Создаем новую выплату
+                        withdrawal = withdrawalRepository.create({
+                            id: withdrawalId,
+                            userId: user.id,
+                            telegramId: userTelegramId,
+                            username: user.username,
+                            firstName: user.firstName,
+                            amount: amount,
+                            status: normalizedStatus,
+                            createdAt: createdAt,
+                            processedAt: processedAt, // Используем null
+                            wallet: 'from_sheets_sync'
+                        });
+                        console.log(`➕ Создана новая выплата: #${withdrawalId} для пользователя ${userTelegramId}`);
+                    } else {
+                        // Обновляем существующую выплату
+                        const oldProcessedAt = withdrawal.processedAt;
+                        const newProcessedAt = processedAt || null; // Убедимся, что это null, а не undefined
+
+                        const hasChanges =
+                            withdrawal.status !== normalizedStatus ||
+                            withdrawal.amount !== amount ||
+                            (oldProcessedAt?.getTime() !== newProcessedAt?.getTime());
+
+                        if (hasChanges) {
+                            withdrawal.status = normalizedStatus;
+                            withdrawal.amount = amount;
+                            withdrawal.processedAt = newProcessedAt; // Присваиваем null если undefined
+                            // Удаляем строку с updatedAt, так как у сущности его нет
+                            // withdrawal.updatedAt = new Date(); // Комментируем эту строку
+
+                            await withdrawalRepository.save(withdrawal);
+                            updatedCount++;
+                            console.log(`🔄 Обновлена выплата #${withdrawalId}: статус=${normalizedStatus}, сумма=${amount}`);
+                        }
+                    }
+
+                } catch (rowError: any) {
+                    console.error(`❌ Ошибка обработки строки выплаты:`, row);
+                    console.error(`❌ Детали ошибки:`, rowError.message);
+                }
+            }
+
+            return updatedCount;
+        } catch (error: any) {
+            console.error('❌ Ошибка чтения выплат из Sheets:', error.message);
+            throw error;
+        }
+    }
+    private async syncBalancesFromSheets(): Promise<number> {
+        try {
+            console.log('💰 Синхронизация балансов из Sheets в БД...');
+
+            // Читаем только нужные колонки: Telegram ID (B) и Баланс (E)
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Пользователи!B2:E', // B: Telegram ID, E: Баланс
+            });
+
+            const rows = response.data.values || [];
+            const userRepository = AppDataSource.getRepository(User);
+            let updatedCount = 0;
+
+            console.log(`📊 Найдено ${rows.length} пользователей для синхронизации балансов`);
+
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                try {
+                    // Формат: [telegramId, firstName, username, stars]
+                    const [
+                        telegramIdStr,    // B: Telegram ID
+                        ,                  // C: Имя (пропускаем)
+                        ,                  // D: Username (пропускаем)
+                        starsStr          // E: Баланс
+                    ] = row;
+
+                    // Отладочный вывод для первых строк
+                    if (i < 3) {
+                        console.log(`🔍 Строка ${i + 2}: telegramId=${telegramIdStr}, баланс="${starsStr}"`);
+                    }
+
+                    if (!telegramIdStr || !starsStr) {
+                        console.log(`⚠️ Пропускаем строку ${i + 2}: нет telegramId или баланса`);
+                        continue;
+                    }
+
+                    const userTelegramId = parseInt(telegramIdStr);
+                    const stars = parseInt(starsStr);
+
+                    if (isNaN(userTelegramId)) {
+                        console.log(`⚠️ Пропускаем строку ${i + 2}: неверный telegramId "${telegramIdStr}"`);
+                        continue;
+                    }
+
+                    if (isNaN(stars)) {
+                        console.log(`⚠️ Пропускаем строку ${i + 2}: неверный баланс "${starsStr}"`);
+                        continue;
+                    }
+
+                    // Находим пользователя в БД
+                    const user = await userRepository.findOne({
+                        where: { telegramId: userTelegramId }
+                    });
+
+                    if (!user) {
+                        console.log(`⚠️ Пользователь с Telegram ID ${userTelegramId} не найден в БД`);
+                        continue;
+                    }
+
+                    // Проверяем, изменился ли баланс
+                    if (user.stars !== stars) {
+                        console.log(`💰 Обновление баланса пользователя ${userTelegramId} (${user.username || 'без username'}): ${user.stars} → ${stars} звезд`);
+
+                        const oldBalance = user.stars;
+                        user.stars = stars;
+                        user.updatedAt = new Date();
+
+                        await userRepository.save(user);
+                        updatedCount++;
+
+                        console.log(`✅ Обновлен баланс: ${oldBalance} → ${stars} для пользователя ${userTelegramId}`);
+                    }
+
+                } catch (rowError: any) {
+                    console.error(`❌ Ошибка обработки строки ${i + 2}:`, row);
+                    console.error(`❌ Детали ошибки:`, rowError.message);
+                }
+            }
+
+            if (updatedCount > 0) {
+                console.log(`✅ Обновлены балансы ${updatedCount} пользователей из Google Sheets`);
+            } else {
+                console.log('📊 Балансы пользователей актуальны (не было изменений)');
+            }
+
+            return updatedCount;
+        } catch (error: any) {
+            console.error('❌ Ошибка синхронизации балансов:', error.message);
+            throw error;
+        }
+    }
+    public async debugSheetStructure(): Promise<void> {
+        try {
+            console.log('🔍 ДЕБАГ: Проверка структуры таблицы "Пользователи"...');
+
+            const response = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Пользователи!A1:Z1', // Заголовки
+            });
+
+            const headers = response.data.values?.[0] || [];
+            console.log('📊 Заголовки таблицы:');
+            headers.forEach((header: string, index: number) => {
+                console.log(`  Колонка ${index + 1} (${String.fromCharCode(65 + index)}): "${header}"`);
+            });
+
+            // Посмотрим первые 3 строки данных
+            const dataResponse = await this.sheets.spreadsheets.values.get({
+                spreadsheetId: this.spreadsheetId,
+                range: 'Пользователи!A2:Z4',
+            });
+
+            const rows = dataResponse.data.values || [];
+            console.log('\n📊 Первые 3 строки данных:');
+            rows.forEach((row: string[], rowIndex: number) => {
+                console.log(`\nСтрока ${rowIndex + 2}:`);
+                row.forEach((cell: string, colIndex: number) => {
+                    console.log(`  ${headers[colIndex] || `Колонка ${colIndex + 1}`}: "${cell}"`);
+                });
+            });
+
+        } catch (error: any) {
+            console.error('❌ Ошибка при проверке структуры таблицы:', error.message);
+        }
+    }
+    /**
+     * Команда для принудительной синхронизации всех данных из Sheets в БД
+     */
+    public async forceSyncFromSheets(): Promise<{
+        success: boolean;
+        message: string;
+        details: {
+            usersUpdated: number;
+            withdrawalsUpdated: number;
+            errors: number;
+        };
+    }> {
+        try {
+            console.log('🚀 ЗАПУСК ПРИНУДИТЕЛЬНОЙ СИНХРОНИЗАЦИИ Sheets → БД...');
+
+            const result = await this.syncFromSheetsToDB();
+
+            return {
+                success: result.errors === 0,
+                message: result.errors === 0
+                    ? `✅ Синхронизация успешно завершена! Обновлено: ${result.usersUpdated} пользователей, ${result.withdrawalsUpdated} выплат`
+                    : `⚠️ Синхронизация завершена с ошибками. Обновлено: ${result.usersUpdated} пользователей, ${result.withdrawalsUpdated} выплат, ошибок: ${result.errors}`,
+                details: result
+            };
+        } catch (error: any) {
+            console.error('❌ Ошибка принудительной синхронизации:', error.message);
+            return {
+                success: false,
+                message: `❌ Ошибка синхронизации: ${error.message}`,
+                details: { usersUpdated: 0, withdrawalsUpdated: 0, errors: 1 }
+            };
         }
     }
 }

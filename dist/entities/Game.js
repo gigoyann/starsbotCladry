@@ -20,7 +20,7 @@ __decorate([
     __metadata("design:type", Number)
 ], Game.prototype, "id", void 0);
 __decorate([
-    (0, typeorm_1.Column)(),
+    (0, typeorm_1.Column)({ type: 'bigint' }),
     __metadata("design:type", Number)
 ], Game.prototype, "userId", void 0);
 __decorate([

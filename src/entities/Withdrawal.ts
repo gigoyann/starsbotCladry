@@ -7,12 +7,13 @@ export class Withdrawal {
     @PrimaryGeneratedColumn()
     id: number;
 
-    @Column()
-    userId: number; // Теперь это ссылается на users.id
+    @Column({ type: 'bigint' })
+    userId: number;
+
 
     @ManyToOne(() => User)
     @JoinColumn({ name: 'userId' })
-    
+
     user: User;
 
     @Column()

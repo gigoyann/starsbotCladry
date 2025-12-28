@@ -6,9 +6,9 @@ export class Game {
     @PrimaryGeneratedColumn()
     id: number;
 
-    @Column()
+    @Column({ type: 'bigint' })
     userId: number;
-
+    
     @ManyToOne(() => User)
     @JoinColumn({ name: 'userId' })
     user: User;

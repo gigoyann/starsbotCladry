@@ -3,6 +3,7 @@ import * as dotenv from 'dotenv';
 import { User } from '../entities/User';
 import { Withdrawal } from '../entities/Withdrawal';
 import { Game } from '../entities/Game';
+import { Captcha } from '../entities/Captcha';
 
 dotenv.config();
 
@@ -15,7 +16,7 @@ export const AppDataSource = new DataSource({
     database: process.env.DB_DATABASE || 'bot_star_db',
     synchronize: false,
     logging: process.env.NODE_ENV !== 'production',
-    entities: [User, Withdrawal, Game],
+    entities: [User, Withdrawal, Game, Captcha],
     migrations: ['dist/migrations/*.js'], // <- путь к скомпилированным JS
     subscribers: [],
 });

@@ -39,6 +39,7 @@ const dotenv = __importStar(require("dotenv"));
 const User_1 = require("../entities/User");
 const Withdrawal_1 = require("../entities/Withdrawal");
 const Game_1 = require("../entities/Game");
+const Captcha_1 = require("../entities/Captcha");
 dotenv.config();
 exports.AppDataSource = new typeorm_1.DataSource({
     type: 'postgres',
@@ -49,7 +50,7 @@ exports.AppDataSource = new typeorm_1.DataSource({
     database: process.env.DB_DATABASE || 'bot_star_db',
     synchronize: false,
     logging: process.env.NODE_ENV !== 'production',
-    entities: [User_1.User, Withdrawal_1.Withdrawal, Game_1.Game],
+    entities: [User_1.User, Withdrawal_1.Withdrawal, Game_1.Game, Captcha_1.Captcha],
     migrations: ['dist/migrations/*.js'], // <- путь к скомпилированным JS
     subscribers: [],
 });
