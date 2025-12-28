@@ -86,6 +86,7 @@ class StarBot {
     }
     constructor() {
         this.captchaStore = new Map();
+        this.broadcastStates = new Map();
         this.channels = process.env.CHANNELS?.split(',') || [];
         this.emojis = process.env.EMOJIS?.split(',') || ['⭐', '🌟', '✨', '💫'];
         this.adminId = parseInt(process.env.ADMIN_ID || '0');
@@ -281,8 +282,8 @@ class StarBot {
                 `📈 Успешность: ${Math.round((result.success / userIds.length) * 100)}%`, { parse_mode: 'Markdown' });
             console.log(`✅ Рассылка завершена. Статистика: ${result.success} успешно, ${result.failed} ошибок`);
             // Очищаем временное сообщение
-            global.broadcastMessage = undefined;
-            global.broadcastAdminId = undefined;
+            global.broadcastMessage = false;
+            global.broadcastAdminId = false;
         });
         // Отмена рассылки
         this.bot.command('cancelbroadcast', async (ctx) => {
@@ -297,8 +298,8 @@ class StarBot {
                 await ctx.reply('❌ Вы не можете отменить рассылку, созданную другим администратором.');
                 return;
             }
-            global.broadcastMessage = undefined;
-            global.broadcastAdminId = undefined;
+            global.broadcastMessage = false;
+            global.broadcastAdminId = false;
             await ctx.reply('✅ Рассылка отменена.');
         });
         // Рассылка с HTML разметкой
@@ -2616,7 +2617,7 @@ class StarBot {
     }
     async showAdminPanel(ctx) {
         const keyboard = telegraf_1.Markup.keyboard([
-            ['📊 Статистика', '📢 Рассылка'],
+            ['📊 Статистика'],
             ['📋 Заявки на вывод', '👥 Топ пользователей'],
             ['↩️ Главное меню']
         ]).resize();
@@ -2629,6 +2630,11 @@ class StarBot {
         // ============ СУЩЕСТВУЮЩИЙ КОД (не удаляем) ============
         // Статистика
         this.bot.hears('📊 Статистика', async (ctx) => {
+            // ТОЛЬКО ДЛЯ АДМИНОВ
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
             const userRepo = data_source_1.AppDataSource.getRepository(User_1.User);
             const withdrawalRepo = data_source_1.AppDataSource.getRepository(Withdrawal_1.Withdrawal);
             const totalUsers = await userRepo.count();
@@ -2707,45 +2713,14 @@ class StarBot {
             }
         });
         // Рассылка
-        this.bot.hears('📢 Рассылка', async (ctx) => {
-            await ctx.reply('📢 РАССЫЛКА СООБЩЕНИЙ\n\n' +
-                'Отправьте сообщение для рассылки всем пользователям.\n' +
-                'Можно использовать Markdown разметку.\n\n' +
-                'Для отмены отправьте /cancel');
-            // Ждем сообщение для рассылки
-            this.bot.on('text', async (ctx2) => {
-                if (ctx2.message.text === '/cancel') {
-                    await ctx2.reply('❌ Рассылка отменена');
-                    return;
-                }
-                const message = ctx2.message.text;
-                await ctx2.reply('⏳ Начинаю рассылку...');
-                const userRepo = data_source_1.AppDataSource.getRepository(User_1.User);
-                const users = await userRepo.find();
-                let success = 0;
-                let failed = 0;
-                for (const user of users) {
-                    try {
-                        await ctx2.telegram.sendMessage(user.telegramId, message, {
-                            parse_mode: 'Markdown'
-                        });
-                        success++;
-                    }
-                    catch (error) {
-                        failed++;
-                    }
-                    // Задержка чтобы не превысить лимиты Telegram
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                }
-                await ctx2.reply(`✅ Рассылка завершена:\n\n` +
-                    `✅ Успешно: ${success} пользователей\n` +
-                    `❌ Не удалось: ${failed} пользователей`);
-            });
-        });
-        // Заявки на вывод
+        // Заявки на вывод - ИСПРАВЛЕННАЯ ВЕРСИЯ
         this.bot.hears('📋 Заявки на вывод', async (ctx) => {
+            // ПРОВЕРКА АДМИНА
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
             const withdrawalRepo = data_source_1.AppDataSource.getRepository(Withdrawal_1.Withdrawal);
-            const userRepo = data_source_1.AppDataSource.getRepository(User_1.User);
             const pendingWithdrawals = await withdrawalRepo.find({
                 where: { status: 'pending' },
                 relations: ['user'],
@@ -2758,18 +2733,36 @@ class StarBot {
             let message = '📋 ЗАЯВКИ НА ВЫВОД (pending):\n\n';
             for (const withdrawal of pendingWithdrawals) {
                 const user = withdrawal.user;
+                // ИСПРАВЛЕННАЯ СТРОКА - защита от null
+                const username = user?.username
+                    ? `@${user.username}`
+                    : withdrawal.username
+                        ? `@${withdrawal.username}`
+                        : 'Нет username';
+                const firstName = user?.firstName
+                    ? user.firstName
+                    : withdrawal.firstName || 'Не указано';
+                const telegramId = user?.telegramId
+                    ? user.telegramId
+                    : withdrawal.telegramId || 'Не указан';
                 message +=
-                    `🆔 ID заявки: ${withdrawal.id}\n` +
-                        `👤 Пользователь: @${user.username || 'Нет username'}\n` +
+                    `🆔 ID заявки: #${withdrawal.id}\n` +
+                        `👤 Пользователь: ${firstName} (${username})\n` +
+                        `🆔 User ID: ${telegramId}\n` +
                         `💰 Сумма: ${withdrawal.amount} звезд\n` +
                         `💳 Кошелек: ${withdrawal.wallet}\n` +
-                        `📅 Дата: ${withdrawal.createdAt.toLocaleDateString()}\n` +
+                        `📅 Дата: ${withdrawal.createdAt.toLocaleDateString('ru-RU')}\n` +
                         `---\n`;
             }
             await ctx.reply(message);
         });
-        // Топ пользователей
+        // Топ пользователей - тоже исправляем
         this.bot.hears('👥 Топ пользователей', async (ctx) => {
+            // ПРОВЕРКА АДМИНА
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
             const userRepo = data_source_1.AppDataSource.getRepository(User_1.User);
             const topUsers = await userRepo.find({
                 order: { stars: 'DESC' },
@@ -2777,11 +2770,15 @@ class StarBot {
             });
             let message = '🏆 ТОП-10 ПОЛЬЗОВАТЕЛЕЙ:\n\n';
             topUsers.forEach((user, index) => {
+                // ИСПРАВЛЕННАЯ СТРОКА - защита от null/undefined
+                const username = user?.username
+                    ? `@${user.username}`
+                    : 'Аноним';
                 message +=
-                    `${index + 1}. @${user.username || 'Аноним'}\n` +
-                        `   ⭐ Звезд: ${user.stars}\n` +
-                        `   👥 Рефералов: ${user.referralsCount}\n` +
-                        `   💎 Всего заработано: ${user.totalEarned}\n` +
+                    `${index + 1}. ${username}\n` +
+                        `   ⭐ Звезд: ${user.stars || 0}\n` +
+                        `   👥 Рефералов: ${user.referralsCount || 0}\n` +
+                        `   💎 Всего заработано: ${user.totalEarned || 0}\n` +
                         `---\n`;
             });
             await ctx.reply(message);
@@ -2920,25 +2917,13 @@ ${result.success ? '🎉 Все данные успешно синхронизи
 
 <b>Админ меню (кнопки):</b>
 • 📊 Статистика - Общая статистика бота
-• 📢 Рассылка - Рассылка сообщений пользователям
 • 📋 Заявки на вывод - Список pending заявок
 • 👥 Топ пользователей - Топ-10 по звездам
 • ↩️ Главное меню - Вернуться в меню
 
 <b>Рассылка сообщений:</b>
 • /broadcast - Отправить сообщение всем пользователям
-• /broadcast_test - Тестовая рассылка (только админу)
 
-<b>Просмотр данных:</b>
-• /users - Список пользователей
-• /withdrawals - Список выплат
-• /stats - Статистика бота
-• /check_ref - Проверка реферальной системы
-
-<b>Управление пользователями:</b>
-• /find_user &lt;id/username&gt; - Найти пользователя
-• /user_stats &lt;id&gt; - Статистика пользователя
-• /update_balance &lt;id&gt; &lt;amount&gt; - Обновить баланс
 
 <code>⚠️ Важно:</code>
 • /sync_from_sheets - обновляет БД данными из Sheets
