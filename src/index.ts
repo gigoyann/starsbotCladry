@@ -1889,7 +1889,7 @@ class StarBot {
             }
 
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = 'animated_slots';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2148,7 +2148,7 @@ class StarBot {
             }
 
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = 'animated_darts';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2250,7 +2250,7 @@ class StarBot {
             }
 
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = 'animated_basketball';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2346,7 +2346,7 @@ class StarBot {
             }
 
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = 'animated_football';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2442,7 +2442,7 @@ class StarBot {
             }
 
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = 'animated_bowling';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
@@ -2630,7 +2630,7 @@ class StarBot {
         try {
             // Сохраняем игру в базу
             const game = new Game();
-            game.userId = user.id;
+            game.userId = user.telegramId;
             game.gameType = gameType;
             game.betAmount = betAmount;
             game.winAmount = winAmount;
