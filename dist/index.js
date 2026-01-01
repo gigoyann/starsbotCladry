@@ -97,6 +97,7 @@ class StarBot {
         this.adminIds = process.env.ADMIN_IDS
             ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id.trim()))
             : [this.adminId];
+        this.setupErrorHandling();
         // СНАЧАЛА настраиваем middleware для получения пользователя
         this.setupMiddlewares();
         this.setupBotCommands();
@@ -125,6 +126,15 @@ class StarBot {
         this.setupAllHandlers();
         // Запускаем периодические проверки
         this.startPeriodicTasks();
+    }
+    setupErrorHandling() {
+        // Глобальный обработчик необработанных ошибок
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+        });
+        process.on('uncaughtException', (error) => {
+            console.error('❌ Uncaught Exception:', error);
+        });
     }
     async initializeGoogleSheets() {
         try {
@@ -661,33 +671,50 @@ class StarBot {
         });
         // 4. Обработчики регистрации и подписки
         this.bot.action(/^check_subscription_(\d+)$/, async (ctx) => {
-            const userId = parseInt(ctx.match[1]);
-            const user = await this.getUser(userId);
-            console.log(`🔍 Проверка подписки для пользователя ${userId}`);
-            const isSubscribed = await this.checkAllSubscriptions(userId);
-            if (isSubscribed) {
-                if (user.completedInitialSetup) {
-                    await ctx.answerCbQuery('✅ Вы уже завершили регистрацию');
-                    await this.showMainMenu(ctx);
+            try {
+                const userId = parseInt(ctx.match[1]);
+                const user = await this.getUser(userId);
+                console.log(`🔍 Проверка подписки для пользователя ${userId}`);
+                const isSubscribed = await this.checkAllSubscriptions(userId);
+                if (isSubscribed) {
+                    if (user.completedInitialSetup) {
+                        await ctx.answerCbQuery('✅ Вы уже завершили регистрацию');
+                        await this.showMainMenu(ctx);
+                        return;
+                    }
+                    user.subscribedToChannels = true;
+                    await data_source_1.AppDataSource.getRepository(User_1.User).save(user);
+                    await ctx.answerCbQuery('✅ Подписка подтверждена!');
+                    // Удаляем старое сообщение если есть
+                    try {
+                        if (ctx.callbackQuery?.message) {
+                            await ctx.deleteMessage();
+                        }
+                    }
+                    catch (e) {
+                        // Игнорируем ошибку удаления
+                    }
+                    // Показываем капчу
+                    await this.showEmojiCaptcha(ctx);
+                }
+                else {
+                    await ctx.answerCbQuery('❌ Вы не подписались на все каналы');
+                }
+            }
+            catch (error) {
+                console.error('❌ Error in check_subscription handler:', error);
+                // Обработка устаревших callback query
+                if (error.response?.description?.includes('too old') ||
+                    error.response?.description?.includes('query ID is invalid')) {
+                    console.log('⚠️ Callback query устарел, игнорируем');
                     return;
                 }
-                user.subscribedToChannels = true;
-                await data_source_1.AppDataSource.getRepository(User_1.User).save(user);
-                await ctx.answerCbQuery('✅ Подписка подтверждена!');
-                // Удаляем старое сообщение если есть
                 try {
-                    if (ctx.callbackQuery?.message) {
-                        await ctx.deleteMessage();
-                    }
+                    await ctx.answerCbQuery('❌ Ошибка при проверке подписки');
                 }
                 catch (e) {
-                    // Игнорируем ошибку удаления
+                    // Игнорируем если не можем ответить
                 }
-                // Показываем капчу
-                await this.showEmojiCaptcha(ctx);
-            }
-            else {
-                await ctx.answerCbQuery('❌ Вы не подписались на все каналы');
             }
         });
         this.bot.action(/^captcha_emoji_(\d+)_(\d+)$/, async (ctx) => {
@@ -951,28 +978,40 @@ class StarBot {
     setupMiddlewares() {
         // Middleware для получения пользователя
         this.bot.use(async (ctx, next) => {
-            if (ctx.from) {
-                if (!ctx.user) {
-                    // Передаем ctx.from для создания пользователя с правильными данными
-                    ctx.user = await this.getUser(ctx.from.id, ctx.from);
+            try {
+                if (ctx.from) {
+                    if (!ctx.user) {
+                        // Передаем ctx.from для создания пользователя с правильными данными
+                        ctx.user = await this.getUser(ctx.from.id, ctx.from);
+                    }
+                    if (ctx.user && ctx.user.isBlocked()) {
+                        // Пользователь заблокирован
+                        console.log(`⛔ Пользователь ${ctx.from.id} заблокирован, доступ запрещен`);
+                        // Отправляем сообщение о блокировке
+                        try {
+                            await ctx.reply('⛔ *Доступ запрещен*\n\n' +
+                                'Ваш аккаунт был заблокирован администратором.\n' +
+                                'Для получения дополнительной информации обратитесь в поддержку.', { parse_mode: 'Markdown' });
+                        }
+                        catch (error) {
+                            // Игнорируем ошибки отправки сообщений
+                        }
+                        // Не продолжаем выполнение обработчиков
+                        return;
+                    }
                 }
-                if (ctx.user && ctx.user.isBlocked()) {
-                    // Пользователь заблокирован
-                    console.log(`⛔ Пользователь ${ctx.from.id} заблокирован, доступ запрещен`);
-                    // Отправляем сообщение о блокировке
-                    try {
-                        await ctx.reply('⛔ *Доступ запрещен*\n\n' +
-                            'Ваш аккаунт был заблокирован администратором.\n' +
-                            'Для получения дополнительной информации обратитесь в поддержку.', { parse_mode: 'Markdown' });
-                    }
-                    catch (error) {
-                        // Игнорируем ошибки отправки сообщений
-                    }
-                    // Не продолжаем выполнение обработчиков
-                    return;
+                await next();
+            }
+            catch (error) {
+                console.error(`❌ Middleware error for user ${ctx.from?.id}:`, error.message);
+                // Отправляем сообщение об ошибке пользователю
+                try {
+                    await ctx.reply('❌ Произошла ошибка. Пожалуйста, попробуйте еще раз через несколько секунд.');
+                }
+                catch (e) {
+                    // Игнорируем если не можем отправить сообщение
                 }
             }
-            await next();
         });
         this.bot.use(async (ctx, next) => {
             // Кастим к нужным типам
@@ -1070,40 +1109,72 @@ class StarBot {
     }
     // Метод для нормализации статуса пользователя
     async getUser(telegramId, from) {
-        try {
-            const userRepository = data_source_1.AppDataSource.getRepository(User_1.User);
-            let user = await userRepository.findOne({
-                where: { telegramId },
-                select: [
-                    'id', 'telegramId', 'username', 'firstName', 'lastName',
-                    'stars', 'totalEarned', 'selectedEmoji', 'subscribedToChannels',
-                    'completedInitialSetup', 'referrerId', 'referralsCount', 'status'
-                ]
-            });
-            if (!user) {
-                console.log(`🆕 Creating new user with Telegram ID: ${telegramId}`);
-                user = userRepository.create({
-                    telegramId,
-                    username: from?.username || null,
-                    firstName: from?.first_name || null,
-                    lastName: from?.last_name || null,
-                    stars: 0,
-                    totalEarned: 0,
-                    referralsCount: 0,
-                    status: 'active',
-                    completedInitialSetup: false,
-                    subscribedToChannels: false,
-                    // НЕ устанавливаем referrerId здесь - это будет сделано в обработчике /start
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 100; // ms
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                const userRepository = data_source_1.AppDataSource.getRepository(User_1.User);
+                // Пытаемся найти пользователя
+                let user = await userRepository.findOne({
+                    where: { telegramId },
+                    select: [
+                        'id', 'telegramId', 'username', 'firstName', 'lastName',
+                        'stars', 'totalEarned', 'selectedEmoji', 'subscribedToChannels',
+                        'completedInitialSetup', 'referrerId', 'referralsCount', 'status'
+                    ]
                 });
-                await userRepository.save(user);
-                console.log(`✅ Created new user: ID ${user.id}, Telegram ID ${telegramId}`);
+                if (!user) {
+                    console.log(`🆕 [Attempt ${attempt}] Creating new user with Telegram ID: ${telegramId}`);
+                    // Создаем нового пользователя с защитой от дублирования
+                    user = userRepository.create({
+                        telegramId,
+                        username: from?.username || null,
+                        firstName: from?.first_name || null,
+                        lastName: from?.last_name || null,
+                        stars: 0,
+                        totalEarned: 0,
+                        referralsCount: 0,
+                        status: 'active',
+                        completedInitialSetup: false,
+                        subscribedToChannels: false,
+                    });
+                    try {
+                        await userRepository.save(user);
+                        console.log(`✅ User created successfully: ID ${user.id}, Telegram ID ${telegramId}`);
+                    }
+                    catch (saveError) {
+                        // Если ошибка уникальности - значит пользователь уже создан другим процессом
+                        if (saveError.code === '23505' || saveError.message?.includes('users_telegramId_key')) {
+                            console.log(`⚠️ User ${telegramId} already exists (race condition), retrying...`);
+                            // Ждем немного и пытаемся найти пользователя снова
+                            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                            user = await userRepository.findOne({
+                                where: { telegramId }
+                            });
+                            if (user) {
+                                console.log(`✅ Found existing user after race condition: ID ${user.id}`);
+                                return user;
+                            }
+                            // Продолжаем цикл
+                            continue;
+                        }
+                        // Другие ошибки - выбрасываем
+                        throw saveError;
+                    }
+                }
+                return user;
             }
-            return user;
+            catch (error) {
+                console.error(`❌ [Attempt ${attempt}] Error getting user ${telegramId}:`, error.message);
+                if (attempt === MAX_RETRIES) {
+                    console.error(`❌ Failed to get user ${telegramId} after ${MAX_RETRIES} attempts`);
+                    throw error;
+                }
+                // Ждем перед следующей попыткой
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * attempt));
+            }
         }
-        catch (error) {
-            console.error('❌ Error getting user:', error);
-            throw error;
-        }
+        throw new Error(`Failed to get or create user ${telegramId}`);
     }
     async showChannelsToSubscribe(ctx) {
         const channels = this.channels;
@@ -3034,9 +3105,26 @@ ${result.success ? '🎉 Все данные успешно синхронизи
         });
     }
     launch() {
+        // Обработчик ошибок Telegraf
+        this.bot.catch((err, ctx) => {
+            console.error('❌ Telegraf error:', err);
+            // Игнорируем ошибки дублирования пользователей (они обрабатываются в getUser)
+            if (err?.message?.includes('users_telegramId_key') ||
+                err?.code === '23505') {
+                console.log('⚠️ Ignoring duplicate user error');
+                return;
+            }
+            try {
+                if (ctx.callbackQuery) {
+                    ctx.answerCbQuery('❌ Ошибка, попробуйте позже').catch(() => { });
+                }
+            }
+            catch (e) {
+                // Игнорируем
+            }
+        });
         this.bot.launch();
-        console.log('Bot is running...');
-        // Включаем graceful stop
+        console.log('✅ Bot is running...');
         process.once('SIGINT', () => this.bot.stop('SIGINT'));
         process.once('SIGTERM', () => this.bot.stop('SIGTERM'));
     }
