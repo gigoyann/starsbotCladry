@@ -749,7 +749,7 @@ class StarBot {
                 'dice': { bet: 3, method: this.playAnimatedDice.bind(this) },
                 'darts': { bet: 4, method: this.playAnimatedDarts.bind(this) },
                 'basketball': { bet: 5, method: this.playAnimatedBasketball.bind(this) },
-                'football': { bet: 5, method: this.playAnimatedFootball.bind(this) },
+                // 'football': { bet: 5, method: this.playAnimatedFootball.bind(this) },
                 'bowling': { bet: 6, method: this.playAnimatedBowling.bind(this) },
                 'guess': { bet: this.GUESS_GAME_BET, method: this.playGuessGame.bind(this) } // ← НОВАЯ ИГРА
             };
@@ -1286,7 +1286,7 @@ class StarBot {
                 `• 🎲 Кости - 3⭐\n` +
                 `• 🏀 Баскетбол - 5⭐\n` +
                 `• 🎯 Дартс - 4⭐\n` +
-                `• ⚽ Футбол - 5⭐\n` +
+                // `• ⚽ Футбол - 5⭐\n` +
                 `• 🎳 Боулинг - 6⭐\n` +
                 `• 🎰 Слоты - 10⭐\n` +
                 `• 🎲 Угадайка - 5⭐ (угадай число 1-6, выигрыш x2)\n` +
@@ -1540,7 +1540,7 @@ class StarBot {
                 ],
                 [
                     telegraf_1.Markup.button.callback('🎯 Дартс (4⭐)', 'play_animated_darts'),
-                    telegraf_1.Markup.button.callback('⚽ Футбол (5⭐)', 'play_animated_football')
+                    // Markup.button.callback('⚽ Футбол (5⭐)', 'play_animated_football')
                 ],
                 [
                     telegraf_1.Markup.button.callback('🎳 Боулинг (6⭐)', 'play_animated_bowling'),
@@ -1663,7 +1663,7 @@ class StarBot {
                 `🎲 Кости\n` +
                 `🏀 Баскетбол\n` +
                 `🎯 Дартс\n` +
-                `⚽ Футбол\n` +
+                // `⚽ Футбол\n` +
                 `🎳 Боулинг\n\n` +
                 `👉 *Регистрируйся по моей ссылке и получи 10⭐ бонуса:*\n` +
                 `${referralLink}\n\n` +
@@ -2667,116 +2667,109 @@ class StarBot {
             resultText
         };
     }
-    async playAnimatedFootball(ctx, betAmount) {
-        const userId = ctx.from.id;
-        try {
-            let user = ctx.user;
-            if (!user) {
-                user = await this.getUser(ctx.from.id);
-                ctx.user = user;
-            }
-            if (user.stars < betAmount) {
-                await ctx.reply(`❌ Недостаточно звезд! Нужно: ${betAmount}, у вас: ${user.stars}`);
-                return;
-            }
-            // Списываем ставку
-            user.stars -= betAmount;
-            const userRepository = data_source_1.AppDataSource.getRepository(User_1.User);
-            await userRepository.save(user);
-            // Немедленно обновляем Google Sheets
-            if (this.googleSheets) {
-                try {
-                    await this.scheduleSheetsUpdate(user);
-                }
-                catch (sheetError) {
-                    console.error('❌ Ошибка обновления таблицы:', sheetError);
-                }
-            }
-            // Отправляем анимацию
-            const animation = await ctx.replyWithDice({ emoji: '⚽' });
-            await new Promise(resolve => setTimeout(resolve, 4000));
-            const footballValue = animation.dice.value;
-            const winResult = this.calculateFootballWin(footballValue, betAmount);
-            const { winAmount, resultText } = winResult;
-            if (winAmount > 0) {
-                user.stars += winAmount;
-                user.totalEarned += winAmount;
-                await userRepository.save(user);
-                // Снова обновляем Google Sheets
-                if (this.googleSheets) {
-                    try {
-                        await this.scheduleSheetsUpdate(user);
-                    }
-                    catch (sheetError) {
-                        console.error('❌ Ошибка обновления таблицы после выигрыш:', sheetError);
-                    }
-                }
-            }
-            else {
-                // Если проиграл, всё равно сохраняем пользователя
-                await userRepository.save(user);
-            }
-            // Сохраняем игру в БД
-            const game = new Game_1.Game();
-            game.userId = user.telegramId;
-            game.gameType = 'animated_football';
-            game.betAmount = betAmount;
-            game.winAmount = winAmount;
-            game.result = winAmount > 0 ? 'win' : 'loss';
-            try {
-                await data_source_1.AppDataSource.getRepository(Game_1.Game).save(game);
-                console.log(`💾 Футбол сохранен в БД для пользователя ${userId}: выигрыш ${winAmount}`);
-            }
-            catch (gameError) {
-                console.error('❌ Ошибка сохранения футбола в БД:', gameError);
-            }
-            // Показываем результат
-            await this.showAnimatedGameResult(ctx, user, 'animated_football', '⚽', footballValue, betAmount, winAmount, resultText);
-        }
-        catch (error) {
-            console.error(`❌ Error in playAnimatedFootball for user ${userId}:`, error);
-            try {
-                await ctx.reply('❌ Ошибка в игре в футбол. Попробуйте позже.');
-            }
-            catch (e) {
-                // Игнорируем
-            }
-            return;
-        }
-    }
-    calculateFootballWin(footballValue, betAmount) {
-        let winMultiplier = 0;
-        let resultText = '';
-        if (footballValue === 5) {
-            // Самый верхний угол - идеальный гол
-            winMultiplier = 2; // можно оставить 8 для большей награды
-            resultText = `⚽ *ИДЕАЛЬНЫЙ ГОЛ!*!`;
-        }
-        else if (footballValue === 4) {
-            // Верхний угол - отличный гол
-            winMultiplier = 1.5;
-            resultText = `⚽ Отличный удар!`;
-        }
-        else if (footballValue === 3) {
-            // Попадание в ворота - обычный гол
-            winMultiplier = 1;
-            resultText = `⚽ *ГОЛ!*`;
-        }
-        else if (footballValue === 2) {
-            // Попадание в штангу/перекладину - НЕ ГОЛ
-            winMultiplier = 0;
-            resultText = `⚽ *ШТАНГА!*`;
-        }
-        else {
-            // footballValue === 1 - Полный промах
-            winMultiplier = 0;
-            resultText = `⚽ *Мимо...*`;
-        }
-        return {
-            winAmount: Math.floor(betAmount * winMultiplier),
-            resultText
-        };
-    }
+    // private async playAnimatedFootball(ctx: BotContext, betAmount: number): Promise<void> {
+    //     const userId = ctx.from!.id;
+    //     try {
+    //         let user = ctx.user;
+    //         if (!user) {
+    //             user = await this.getUser(ctx.from!.id);
+    //             ctx.user = user;
+    //         }
+    //         if (user.stars < betAmount) {
+    //             await ctx.reply(`❌ Недостаточно звезд! Нужно: ${betAmount}, у вас: ${user.stars}`);
+    //             return;
+    //         }
+    //         // Списываем ставку
+    //         user.stars -= betAmount;
+    //         const userRepository = AppDataSource.getRepository(User);
+    //         await userRepository.save(user);
+    //         // Немедленно обновляем Google Sheets
+    //         if (this.googleSheets) {
+    //             try {
+    //                 await this.scheduleSheetsUpdate(user);
+    //             } catch (sheetError) {
+    //                 console.error('❌ Ошибка обновления таблицы:', sheetError);
+    //             }
+    //         }
+    //         // Отправляем анимацию
+    //         const animation = await ctx.replyWithDice({ emoji: '⚽' });
+    //         await new Promise(resolve => setTimeout(resolve, 4000));
+    //         const footballValue = animation.dice.value;
+    //         const winResult = this.calculateFootballWin(footballValue, betAmount);
+    //         const { winAmount, resultText } = winResult;
+    //         if (winAmount > 0) {
+    //             user.stars += winAmount;
+    //             user.totalEarned += winAmount;
+    //             await userRepository.save(user);
+    //             // Снова обновляем Google Sheets
+    //             if (this.googleSheets) {
+    //                 try {
+    //                     await this.scheduleSheetsUpdate(user);
+    //                 } catch (sheetError) {
+    //                     console.error('❌ Ошибка обновления таблицы после выигрыш:', sheetError);
+    //                 }
+    //             }
+    //         } else {
+    //             // Если проиграл, всё равно сохраняем пользователя
+    //             await userRepository.save(user);
+    //         }
+    //         // Сохраняем игру в БД
+    //         const game = new Game();
+    //         game.userId = user.telegramId;
+    //         game.gameType = 'animated_football';
+    //         game.betAmount = betAmount;
+    //         game.winAmount = winAmount;
+    //         game.result = winAmount > 0 ? 'win' : 'loss';
+    //         try {
+    //             await AppDataSource.getRepository(Game).save(game);
+    //             console.log(`💾 Футбол сохранен в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+    //         } catch (gameError) {
+    //             console.error('❌ Ошибка сохранения футбола в БД:', gameError);
+    //         }
+    //         // Показываем результат
+    //         await this.showAnimatedGameResult(
+    //             ctx, user, 'animated_football', '⚽',
+    //             footballValue, betAmount, winAmount, resultText
+    //         );
+    //     } catch (error: any) {
+    //         console.error(`❌ Error in playAnimatedFootball for user ${userId}:`, error);
+    //         try {
+    //             await ctx.reply('❌ Ошибка в игре в футбол. Попробуйте позже.');
+    //         } catch (e) {
+    //             // Игнорируем
+    //         }
+    //         return;
+    //     }
+    // }
+    // private calculateFootballWin(footballValue: number, betAmount: number): { winAmount: number, resultText: string } {
+    //     let winMultiplier = 0;
+    //     let resultText = '';
+    //     if (footballValue === 5) {
+    //         // Самый верхний угол - идеальный гол
+    //         winMultiplier = 2; // можно оставить 8 для большей награды
+    //         resultText = `⚽ *ИДЕАЛЬНЫЙ ГОЛ!*!`;
+    //     } else if (footballValue === 4) {
+    //         // Верхний угол - отличный гол
+    //         winMultiplier = 1.5;
+    //         resultText = `⚽ Отличный удар!`;
+    //     } else if (footballValue === 3) {
+    //         // Попадание в ворота - обычный гол
+    //         winMultiplier = 1;
+    //         resultText = `⚽ *ГОЛ!*`;
+    //     } else if (footballValue === 2) {
+    //         // Попадание в штангу/перекладину - НЕ ГОЛ
+    //         winMultiplier = 0;
+    //         resultText = `⚽ *ШТАНГА!*`;
+    //     } else {
+    //         // footballValue === 1 - Полный промах
+    //         winMultiplier = 0;
+    //         resultText = `⚽ *Мимо...*`;
+    //     }
+    //     return {
+    //         winAmount: Math.floor(betAmount * winMultiplier),
+    //         resultText
+    //     };
+    // }
     async playAnimatedBowling(ctx, betAmount) {
         const userId = ctx.from.id;
         try {
@@ -2908,7 +2901,7 @@ class StarBot {
             'animated_dice': '🎲 Кости',
             'animated_darts': '🎯 Дартс',
             'animated_basketball': '🏀 Баскетбол',
-            'animated_football': '⚽ Футбол',
+            // 'animated_football': '⚽ Футбол',
             'animated_bowling': '🎳 Боулинг',
             'guess_dice': '🎲 Угадайка'
         };
@@ -2991,13 +2984,13 @@ class StarBot {
             'animated_dice': '🎲 Кости',
             'animated_darts': '🎯 Дартс',
             'animated_basketball': '🏀 Баскетбол',
-            'animated_football': '⚽ Футбол',
+            // 'animated_football': '⚽ Футбол',
             'animated_bowling': '🎳 Боулинг',
             'slots': '🎰 Слоты',
             'dice': '🎲 Кости',
             'darts': '🎯 Дартс',
             'basketball': '🏀 Баскетбол',
-            'football': '⚽ Футбол',
+            // 'football': '⚽ Футбол',
             'bowling': '🎳 Боулинг'
         };
         return names[gameType] || gameType;
