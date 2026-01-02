@@ -30,8 +30,12 @@ class StarBot {
         attempts: number;
         userId: number;
     }>();
-
-
+    private readonly MIN_REFERRALS_FOR_WITHDRAWAL = 5;
+    private readonly GUESS_GAME_BET = 5; // Ставка для игры
+    private activeGames = new Map<number, number>();
+    private lastButtonPress = new Map<number, number>();
+    private readonly GAME_TIMEOUT = 10000; // 10 секунд максимум на игру
+    private readonly DEBOUNCE_TIME = 1000; // 1 секунда между нажатиями
     private broadcastStates = new Map<number, boolean>();
     private channels: string[] = process.env.CHANNELS?.split(',') || [];
     private emojis: string[] = process.env.EMOJIS?.split(',') || ['⭐', '🌟', '✨', '💫'];
@@ -63,6 +67,104 @@ class StarBot {
 
         this.sheetsUpdateTimeouts.set(userId, timeout);
     }
+
+    private async checkAndSetGameLock(ctx: BotContext): Promise<boolean> {
+        const userId = ctx.from!.id;
+        const now = Date.now();
+
+        // 1. Проверка debounce (быстрое нажатие)
+        const lastPress = this.lastButtonPress.get(userId);
+        if (lastPress && (now - lastPress) < this.DEBOUNCE_TIME) {
+            console.log(`🚫 User ${userId} clicking too fast (debounce)`);
+            try {
+                await ctx.answerCbQuery('⏳ Не так быстро!');
+            } catch (e) {
+                // Игнорируем
+            }
+            return false;
+        }
+
+        // 2. Проверка активной игры
+        const gameStartTime = this.activeGames.get(userId);
+        if (gameStartTime) {
+            const timeInGame = now - gameStartTime;
+
+            if (timeInGame < this.GAME_TIMEOUT) {
+                console.log(`🚫 User ${userId} already in game (${timeInGame}ms)`);
+                try {
+                    await ctx.answerCbQuery('🎮 Вы уже в игре!');
+                } catch (e) {
+                    // Игнорируем
+                }
+                return false;
+            } else {
+                // Игра висит дольше таймаута - очищаем
+                console.log(`🧹 Clearing stale game for user ${userId}`);
+                this.activeGames.delete(userId);
+            }
+        }
+
+        // 3. Устанавливаем блокировки
+        this.lastButtonPress.set(userId, now);
+        this.activeGames.set(userId, now);
+
+        console.log(`🔒 Game lock set for user ${userId}`);
+        return true;
+    }
+    private releaseGameLock(userId: number): void {
+        this.activeGames.delete(userId);
+        console.log(`🔓 Game lock released for user ${userId}`);
+
+        // Автоматически очищаем через таймаут на всякий случай
+        setTimeout(() => {
+            if (this.activeGames.has(userId)) {
+                console.log(`🧹 Auto-clearing game lock for user ${userId}`);
+                this.activeGames.delete(userId);
+            }
+        }, this.GAME_TIMEOUT + 5000); // +5 секунд запаса
+    }
+    private async withGameLock(ctx: BotContext, gameCallback: Function, betAmount?: number): Promise<void> {
+        const userId = ctx.from!.id;
+
+        // Проверка баланса если есть ставка
+        if (betAmount !== undefined) {
+            const hasBalance = await this.checkBalanceBeforeGame(ctx, betAmount);
+            if (!hasBalance) {
+                return;
+            }
+        }
+        const canPlay = await this.checkAndSetGameLock(ctx);
+        if (!canPlay) {
+            return;
+        }
+
+        try {
+            // Отвечаем на callback query
+            await ctx.answerCbQuery('🎮 Запускаем игру...');
+
+            // Запускаем игру
+            await gameCallback();
+
+        } catch (error: any) {
+            console.error(`❌ Game error for user ${userId}:`, error);
+
+            // Показываем ошибку
+            try {
+                await ctx.answerCbQuery('❌ Ошибка в игре');
+                if (ctx.callbackQuery?.message) {
+                    await ctx.reply('❌ Произошла ошибка во время игры');
+                }
+            } catch (e) {
+                // Игнорируем
+            }
+
+            throw error;
+
+        } finally {
+            // Гарантированно снимаем блокировку
+            this.releaseGameLock(userId);
+        }
+    }
     private googleSheets: GoogleSheetsService;
     private async setupBotCommands() {
         try {
@@ -92,7 +194,9 @@ class StarBot {
         // СНАЧАЛА настраиваем middleware для получения пользователя
         this.setupMiddlewares();
         this.setupBotCommands();
-
+        setInterval(() => this.cleanupOldLocks(), 60 * 1000);
+        // Очистка при старте
+        this.cleanupOldLocks();
         // Инициализируем Google Sheets если есть ID
         if (process.env.GOOGLE_SHEET_ID) {
             this.googleSheets = new GoogleSheetsService();
@@ -121,6 +225,54 @@ class StarBot {
 
         // Запускаем периодические проверки
         this.startPeriodicTasks();
+    }
+    private cleanupOldLocks(): void {
+        const now = Date.now();
+        let cleared = 0;
+
+        for (const [userId, startTime] of this.activeGames.entries()) {
+            if (now - startTime > this.GAME_TIMEOUT + 30000) { // +30 секунд запаса
+                this.activeGames.delete(userId);
+                cleared++;
+                console.log(`🧹 Cleared old game lock for user ${userId}`);
+            }
+        }
+
+        if (cleared > 0) {
+            console.log(`🧹 Total cleared locks: ${cleared}`);
+        }
+    }
+    private async checkBalanceBeforeGame(ctx: BotContext, betAmount: number): Promise<boolean> {
+        const user = ctx.user!;
+
+        if (user.stars < betAmount) {
+            try {
+                await ctx.answerCbQuery(`❌ Недостаточно звезд! Нужно: ${betAmount}`);
+
+                // Показываем меню баланса
+                const keyboard = {
+                    inline_keyboard: [[
+                        { text: '💰 Пополнить баланс', callback_data: 'show_balance' },
+                        { text: '🎮 Игры', callback_data: 'play_games' }
+                    ]]
+                };
+
+                if (ctx.callbackQuery?.message) {
+                    await ctx.editMessageText(
+                        `❌ *Недостаточно звезд!*\n\n` +
+                        `💰 Нужно: ${betAmount} ⭐\n` +
+                        `⭐ У вас: ${user.stars} ⭐\n\n` +
+                        `💡 Получите больше звезд через рефералов или подождите ежедневный бонус!`,
+                        { parse_mode: 'Markdown', reply_markup: keyboard }
+                    );
+                }
+            } catch (e) {
+                // Игнорируем
+            }
+            return false;
+        }
+
+        return true;
     }
     private setupErrorHandling() {
         // Глобальный обработчик необработанных ошибок
@@ -692,7 +844,7 @@ class StarBot {
                 `🆔 Telegram ID: ${user.telegramId}\n` +
                 `👥 Рефералов: ${user.referralsCount}\n` +
                 `🔗 ID реферера: ${user.referrerId || 'Нет'}\n` +
-                `⭐ Звезд с рефералов: ${(user.referralsCount || 0) * 3}`,
+                `⭐ Звезд с рефералов: ${(user.referralsCount || 0) * 5}`,
                 { parse_mode: 'Markdown' }
             );
         });
@@ -700,7 +852,7 @@ class StarBot {
         this.bot.command('referral', async (ctx) => {
             const user = ctx.user!;
             const referralLink = `https://t.me/${ctx.botInfo.username}?start=${user.telegramId}`;
-            const earnedFromReferrals = (user.referralsCount || 0) * 3;
+            const earnedFromReferrals = (user.referralsCount || 0) * 5;
 
             await ctx.reply(
                 `👥 *Реферальная система*\n` +
@@ -711,7 +863,7 @@ class StarBot {
                 `• Приглашено: ${user.referralsCount || 0}\n` +
                 `• Заработано: ${earnedFromReferrals} ⭐\n\n` +
                 `💰 *Награды:*\n` +
-                `• Вы: +3⭐ за каждого друга\n` +
+                `• Вы: +5⭐ за каждого друга\n` +
                 `• Друг: +10⭐ при регистрации\n` +
                 `═══════════════════`,
                 { parse_mode: 'Markdown' }
@@ -722,42 +874,43 @@ class StarBot {
         this.bot.action(/^play_animated_(.+)$/, async (ctx) => {
             const gameType = ctx.match[1];
 
-            // СРАЗУ отвечаем на callback query чтобы избежать таймаута
-            try {
-                await ctx.answerCbQuery('🎮 Запускаем игру...');
-            } catch (error: any) {
-                // Если callback устарел, игнорируем ошибку
-                if (error.response?.description?.includes('too old') ||
-                    error.response?.description?.includes('query ID is invalid')) {
-                    console.log('⚠️ Callback query устарел, продолжаем игру без ответа');
-                } else {
-                    console.error('❌ Ошибка answerCbQuery в игре:', error.message);
-                }
-            }
-
             const gameConfig: { [key: string]: { bet: number, method: Function } } = {
                 'slots': { bet: 10, method: this.playAnimatedSlots.bind(this) },
                 'dice': { bet: 3, method: this.playAnimatedDice.bind(this) },
                 'darts': { bet: 4, method: this.playAnimatedDarts.bind(this) },
                 'basketball': { bet: 5, method: this.playAnimatedBasketball.bind(this) },
                 'football': { bet: 5, method: this.playAnimatedFootball.bind(this) },
-                'bowling': { bet: 6, method: this.playAnimatedBowling.bind(this) }
+                'bowling': { bet: 6, method: this.playAnimatedBowling.bind(this) },
+                'guess': { bet: this.GUESS_GAME_BET, method: this.playGuessGame.bind(this) } // ← НОВАЯ ИГРА
             };
 
             const config = gameConfig[gameType];
             if (config) {
-                try {
-                    await config.method(ctx, config.bet);
-                } catch (error) {
-                    console.error(`❌ Ошибка в игре ${gameType}:`, error);
-                    // Пытаемся отправить сообщение об ошибке
-                    try {
-                        await ctx.reply('❌ Произошла ошибка при запуске игры. Попробуйте позже.');
-                    } catch (e) {
-                        // Игнорируем если не можем отправить сообщение
-                    }
+                if (gameType === 'guess') {
+                    // Для угадайки сначала показываем меню выбора числа
+                    await this.showGuessNumberMenu(ctx);
+                } else {
+                    // Используем обертку с блокировкой
+                    await this.withGameLock(ctx, async () => {
+                        await config.method(ctx, config.bet);
+                    }, config.bet);
                 }
             }
+        });
+
+        // Обработчик "Играть снова"
+        this.bot.action('play_again', async (ctx) => {
+            await this.withGameLock(ctx, async () => {
+                await this.showGamesMenu(ctx);
+            });
+        });
+
+        // Обработчик "Другая игра"
+        this.bot.action('other_game', async (ctx) => {
+            await this.withGameLock(ctx, async () => {
+                await this.showGamesMenu(ctx);
+            });
+
         });
         // 3. Обработчики навигации
         this.bot.action('back_to_menu', async (ctx) => {
@@ -892,7 +1045,14 @@ class StarBot {
         this.bot.command('help', async (ctx) => {
             await this.showHelp;
         });
+        this.bot.action(/^guess_number_(\d+)$/, async (ctx) => {
+            const chosenNumber = parseInt(ctx.match[1]);
 
+            // Используем обертку с блокировкой
+            await this.withGameLock(ctx, async () => {
+                await this.playGuessGame(ctx, chosenNumber);
+            }, this.GUESS_GAME_BET);
+        });
         this.bot.action('withdraw_100', async (ctx) => {
             await ctx.answerCbQuery(); // Это важно!
             console.log('withdraw_100 clicked');
@@ -925,6 +1085,82 @@ class StarBot {
         });
 
     }
+
+    private async showGuessNumberMenu(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+            const betAmount = this.GUESS_GAME_BET;
+
+            // Проверка баланса
+            if (user.stars < betAmount) {
+                await ctx.answerCbQuery(`❌ Недостаточно звезд! Нужно: ${betAmount}`);
+
+                const keyboard = {
+                    inline_keyboard: [[
+                        { text: '💰 Пополнить баланс', callback_data: 'show_balance' },
+                        { text: '🎮 Игры', callback_data: 'play_games' }
+                    ]]
+                };
+
+                if (ctx.callbackQuery?.message) {
+                    await ctx.editMessageText(
+                        `❌ *Недостаточно звезд!*\n\n` +
+                        `💰 Ставка: ${betAmount} ⭐\n` +
+                        `⭐ У вас: ${user.stars} ⭐\n\n` +
+                        `💡 Получите больше звезд через рефералов!`,
+                        { parse_mode: 'Markdown', reply_markup: keyboard }
+                    );
+                }
+                return;
+            }
+
+            const menuText =
+                `🎲 *УГАДАЙ ЧИСЛО*\n` +
+                `═══════════════════\n` +
+                `💰 Ставка: ${betAmount} ⭐\n` +
+                `⭐ Баланс: ${user.stars} ⭐\n` +
+                `═══════════════════\n` +
+                `🎯 Угадайте число от 1 до 6\n` +
+                `🎁 Выигрыш: x3 ставки\n` +
+                `═══════════════════\n` +
+                `Выберите число:`;
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '1 ⚀', callback_data: 'guess_number_1' },
+                        { text: '2 ⚁', callback_data: 'guess_number_2' },
+                        { text: '3 ⚂', callback_data: 'guess_number_3' }
+                    ],
+                    [
+                        { text: '4 ⚃', callback_data: 'guess_number_4' },
+                        { text: '5 ⚄', callback_data: 'guess_number_5' },
+                        { text: '6 ⚅', callback_data: 'guess_number_6' }
+                    ],
+                    [
+                        { text: '⬅️ Назад к играм', callback_data: 'back_to_games' }
+                    ]
+                ]
+            };
+
+            if (ctx.callbackQuery) {
+                await ctx.editMessageText(menuText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+                await ctx.answerCbQuery();
+            } else {
+                await ctx.reply(menuText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error: any) {
+            console.error('❌ Error in showGuessNumberMenu:', error);
+            await ctx.answerCbQuery('❌ Ошибка при загрузке игры');
+        }
+    }
     private async showUserWithdrawals(ctx: BotContext): Promise<void> {
         try {
             const user = ctx.user!;
@@ -944,7 +1180,7 @@ class StarBot {
                     '1. Нажмите "💰 Вывод средств"\n' +
                     '2. Выберите сумму\n' +
                     '3. Дождитесь обработки администратором\n\n' +
-                    'Минимальная сумма вывода: 50 ⭐',
+                    'Минимальная сумма вывода: 100 ⭐',
                     { parse_mode: 'Markdown' }
                 );
                 return;
@@ -1090,6 +1326,22 @@ class StarBot {
         try {
             const user = ctx.user!;
 
+            // Получаем актуальные данные
+            const userRepository = AppDataSource.getRepository(User);
+            const currentUser = await userRepository.findOne({
+                where: { id: user.id },
+                select: ['stars', 'referralsCount', 'totalEarned']
+            });
+
+            if (!currentUser) {
+                await ctx.reply('❌ Ошибка загрузки баланса');
+                return;
+            }
+
+            const userStars = currentUser.stars;
+            const referralsCount = currentUser.referralsCount || 0;
+            const totalEarned = currentUser.totalEarned || 0;
+
             // Получаем статистику выплат
             const withdrawalRepository = AppDataSource.getRepository(Withdrawal);
             const withdrawals = await withdrawalRepository.find({
@@ -1097,27 +1349,42 @@ class StarBot {
             });
 
             const totalWithdrawn = withdrawals
-                .filter(w => w.status === 'approved') // Только approved
+                .filter(w => w.status === 'approved')
                 .reduce((sum, w) => sum + w.amount, 0);
 
             const pendingWithdrawn = withdrawals
                 .filter(w => w.status === 'pending')
                 .reduce((sum, w) => sum + w.amount, 0);
 
-            const message = `💰 *Ваш баланс*\n\n` +
-                `⭐ Звезды: ${user.stars}\n` +
-                `💰 Всего заработано: ${user.totalEarned || 0}\n\n` +
-                `📊 *Статистика выплат:*\n` +
+            // Проверяем достаточно ли рефералов для вывода
+            const hasEnoughReferrals = referralsCount >= this.MIN_REFERRALS_FOR_WITHDRAWAL;
+            const neededReferrals = this.MIN_REFERRALS_FOR_WITHDRAWAL - referralsCount;
+
+            let message = `💰 *Ваш баланс*\n\n` +
+                `⭐ Звезды: ${userStars}\n` +
+                `💰 Всего заработано: ${totalEarned}\n` +
+                `👥 Рефералов: ${referralsCount} из ${this.MIN_REFERRALS_FOR_WITHDRAWAL}\n`;
+
+            if (!hasEnoughReferrals) {
+                message += `⚠️ *Для вывода пригласите еще ${neededReferrals} ${this.getReferralWord(neededReferrals)}*\n\n`;
+            } else {
+                message += `✅ *Достаточно рефералов для вывода*\n\n`;
+            }
+
+            message += `📊 *Статистика выплат:*\n` +
                 `• Одобрено к выплате: ${totalWithdrawn} ⭐\n` +
                 `• В ожидании вывода: ${pendingWithdrawn} ⭐\n` +
                 `• Всего заявок: ${withdrawals.length}\n\n` +
-                `💳 *Минимальный вывод:* 50 ⭐`;
+                `💳 *Минимальный вывод:* 100 ⭐`;
 
             const keyboard = {
                 inline_keyboard: [
                     [
                         { text: '📋 Мои заявки', callback_data: 'show_my_withdrawals' },
                         { text: '💰 Вывод', callback_data: 'withdraw' }
+                    ],
+                    [
+                        { text: '👥 Пригласить друзей', callback_data: 'show_referrals' }
                     ],
                     [
                         { text: '🏠 В меню', callback_data: 'back_to_menu' }
@@ -1233,9 +1500,10 @@ class StarBot {
                 `• ⚽ Футбол - 5⭐\n` +
                 `• 🎳 Боулинг - 6⭐\n` +
                 `• 🎰 Слоты - 10⭐\n` +
+                `• 🎲 Угадайка - 5⭐ (угадай число 1-6, выигрыш x2)\n` +
                 `═══════════════════\n` +
                 `💰 *Реферальная система:*\n` +
-                `• Вы получаете 3⭐ за каждого друга\n` +
+                `• Вы получаете 5⭐ за каждого друга\n` +
                 `• Друг получает 10⭐ при регистрации\n` +
                 `• Минимальный вывод: 100⭐\n` +
                 `═══════════════════\n` +
@@ -1535,6 +1803,9 @@ class StarBot {
                     Markup.button.callback('🎰 Слоты (10⭐)', 'play_animated_slots')
                 ],
                 [
+                    Markup.button.callback('🎲 Угадайка (5⭐)', 'play_animated_guess'), // ← НОВАЯ ИГРА
+                ],
+                [
                     Markup.button.callback('⬅️ Назад в меню', 'back_to_menu')
                 ]
             ]);
@@ -1562,19 +1833,38 @@ class StarBot {
             const user = ctx.user!;
             const referralLink = `https://t.me/${ctx.botInfo.username}?start=${user.telegramId}`;
 
-            // Расчет заработанных звезд (3 за каждого реферала)
-            const earnedFromReferrals = (user.referralsCount || 0) * 3;
+            // Получаем актуальные данные
+            const userRepository = AppDataSource.getRepository(User);
+            const currentUser = await userRepository.findOne({
+                where: { id: user.id },
+                select: ['referralsCount']
+            });
 
-            const menuText =
-                `👥 *Реферальная система*\n` +
+            const referralsCount = currentUser?.referralsCount || 0;
+            const earnedFromReferrals = referralsCount * 3;
+
+            // Проверяем достаточно ли рефералов для вывода
+            const hasEnoughReferrals = referralsCount >= this.MIN_REFERRALS_FOR_WITHDRAWAL;
+            const neededReferrals = this.MIN_REFERRALS_FOR_WITHDRAWAL - referralsCount;
+
+            let menuText = `👥 *Реферальная система*\n` +
                 `═══════════════════\n` +
                 `🎯 Ваша реферальная ссылка:\n` +
                 `\`${referralLink}\`\n\n` +
                 `📊 Статистика:\n` +
-                `• Приглашено: ${user.referralsCount || 0}\n` +
-                `• Заработано: ${earnedFromReferrals} ⭐\n\n` +
-                `💰 *Награды:*\n` +
-                `• Вы: +3⭐ за каждого друга\n` +
+                `• Приглашено: ${referralsCount}\n` +
+                `• Заработано: ${earnedFromReferrals} ⭐\n\n`;
+
+            if (!hasEnoughReferrals) {
+                menuText += `⚠️ *Для вывода средств необходимо:*\n` +
+                    `• Пригласить еще ${neededReferrals} ${this.getReferralWord(neededReferrals)}\n` +
+                    `• Всего должно быть: ${this.MIN_REFERRALS_FOR_WITHDRAWAL}\n\n`;
+            } else {
+                menuText += `✅ *Достаточно рефералов для вывода!*\n\n`;
+            }
+
+            menuText += `💰 *Награды:*\n` +
+                `• Вы: +5⭐ за каждого друга\n` +
                 `• Друг: +10⭐ при регистрации\n` +
                 `═══════════════════`;
 
@@ -1619,7 +1909,7 @@ class StarBot {
                 `📋 *Как использовать:*\n` +
                 `1. Отправьте ссылку другу\n` +
                 `2. Друг должен нажать на ссылку и начать диалог с ботом\n` +
-                `3. После регистрации вы получите 3⭐\n` +
+                `3. После регистрации вы получите 5⭐\n` +
                 `4. Друг получит 10⭐ за регистрацию`,
                 { parse_mode: 'Markdown' }
             );
@@ -1649,7 +1939,7 @@ class StarBot {
                 `${referralLink}\n\n` +
                 `🎁 *Бонусы:*\n` +
                 `• Ты получишь 10⭐ при регистрации\n` +
-                `• Я получу 3⭐ за твое приглашение`;
+                `• Я получу 5⭐ за твое приглашение`;
 
             await ctx.reply(shareText, {
                 parse_mode: 'Markdown',
@@ -1675,34 +1965,91 @@ class StarBot {
 
         try {
             const user = ctx.user!;
-            const minWithdraw = 50;
+            const minWithdraw = 100;
 
-            // Проверка username
+            // 1. Проверка username
             if (!user.username) {
                 const message = '❌ *Для вывода средств необходим username в Telegram!*';
                 await this.sendErrorMessage(ctx, message, 'withdraw');
                 return;
             }
 
-            // Проверка минимальной суммы
+            // 2. Проверка минимальной суммы
             if (amount < minWithdraw) {
                 const message = `❌ Минимальная сумма: ${minWithdraw} ⭐`;
                 await this.sendErrorMessage(ctx, message, 'withdraw');
                 return;
             }
 
-            // Проверка баланса
+            // 3. Проверка баланса
             if (user.stars < amount) {
                 const message = `❌ Недостаточно средств! Нужно: ${amount} ⭐\nВаш баланс: ${user.stars} ⭐`;
                 await this.sendErrorMessage(ctx, message, 'withdraw');
                 return;
             }
 
-            // Снимаем средства с баланса пользователя
+            // 4. Проверка количества рефералов
+            const userRepository = AppDataSource.getRepository(User);
+            const currentUser = await userRepository.findOne({
+                where: { id: user.id },
+                select: ['referralsCount']
+            });
+
+            const referralsCount = currentUser?.referralsCount || 0;
+
+            if (referralsCount < this.MIN_REFERRALS_FOR_WITHDRAWAL) {
+                const needed = this.MIN_REFERRALS_FOR_WITHDRAWAL - referralsCount;
+
+                const message = `❌ *Недостаточно рефералов для вывода!*\n\n` +
+                    `📊 *Текущая статистика:*\n` +
+                    `• Приглашено друзей: ${referralsCount}\n` +
+                    `• Необходимо минимум: ${this.MIN_REFERRALS_FOR_WITHDRAWAL}\n` +
+                    `• Не хватает: ${needed} ${this.getReferralWord(needed)}\n\n` +
+                    `🎁 *Как пригласить друзей:*\n` +
+                    `1. Нажмите "👥 Пригласить друзей"\n` +
+                    `2. Поделитесь своей реферальной ссылкой\n` +
+                    `3. За каждого друга получаете 5⭐\n` +
+                    `4. Друг получает 10⭐ при регистрации\n\n` +
+                    `💡 *Пригласите ${needed} ${this.getReferralWord(needed)} и сможете выводить средства!*`;
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '👥 Пригласить друзей', callback_data: 'show_referrals' },
+                            { text: '📊 Мой профиль', callback_data: 'back_to_menu' }
+                        ]
+                    ]
+                };
+
+                if (ctx.callbackQuery) {
+                    await ctx.answerCbQuery('❌ Недостаточно рефералов');
+                    try {
+                        if (ctx.callbackQuery.message) {
+                            await ctx.editMessageText(message, {
+                                parse_mode: 'Markdown',
+                                reply_markup: keyboard
+                            });
+                        }
+                    } catch (editError) {
+                        await ctx.reply(message, {
+                            parse_mode: 'Markdown',
+                            reply_markup: keyboard
+                        });
+                    }
+                } else {
+                    await ctx.reply(message, {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                }
+
+                return;
+            }
+
+            // 5. Снимаем средства с баланса пользователя (только если прошли все проверки)
             user.stars -= amount;
             console.log(`💰 Списано ${amount} звезд. Новый баланс пользователя ${user.telegramId}: ${user.stars}`);
 
-            const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
 
             // Немедленно обновляем Google Sheets
@@ -1715,11 +2062,16 @@ class StarBot {
                 }
             }
 
-            // Создаем заявку на вывод
+            // 6. Создаем заявку на вывод
             const withdrawal = await this.createWithdrawalRequest(user, amount);
 
-            // Отправляем подтверждение
-            const confirmationMessage = `✅ *Заявка на вывод #${withdrawal.id} создана!*`;
+            // 7. Отправляем подтверждение
+            const confirmationMessage = `✅ *Заявка на вывод #${withdrawal.id} создана!*\n\n` +
+                `💰 *Сумма:* ${amount} ⭐\n` +
+                `👥 *Рефералов:* ${referralsCount} (требуется: ${this.MIN_REFERRALS_FOR_WITHDRAWAL})\n` +
+                `📊 *Статус:* ожидание обработки администратором\n` +
+                `⏰ *Срок:* до 24 часов\n\n` +
+                `💡 Вы получите уведомление, когда заявка будет обработана.`;
 
             if (ctx.callbackQuery) {
                 await ctx.answerCbQuery(`✅ Заявка #${withdrawal.id} на ${amount}⭐ отправлена!`);
@@ -1736,10 +2088,10 @@ class StarBot {
                 await ctx.reply(confirmationMessage, { parse_mode: 'Markdown' });
             }
 
-            // Сбрасываем флаг
+            // 8. Сбрасываем флаг
             ctx.waitingForWithdrawAmount = false;
 
-            // Синхронизируем с Google Sheets
+            // 9. Синхронизируем с Google Sheets
             if (this.googleSheets) {
                 try {
                     await this.googleSheets.syncWithdrawalSimple(withdrawal, this.bot);
@@ -1748,8 +2100,8 @@ class StarBot {
                 }
             }
 
-            // Уведомляем администратора
-            await this.notifyAdminAboutWithdrawal(user, amount, withdrawal.id);
+            // 10. Уведомляем администратора
+            await this.notifyAdminAboutWithdrawal(user, amount, withdrawal.id, referralsCount);
 
         } catch (error) {
             console.error('❌ Error processing withdraw:', error);
@@ -1774,6 +2126,15 @@ class StarBot {
                 await ctx.answerCbQuery(errorMessage);
             }
             await ctx.reply('❌ Произошла ошибка при создании заявки. Попробуйте позже.');
+        }
+    }
+    private getReferralWord(count: number): string {
+        if (count % 10 === 1 && count % 100 !== 11) {
+            return 'реферала';
+        } else if (count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 10 || count % 100 >= 20)) {
+            return 'реферала';
+        } else {
+            return 'рефералов';
         }
     }
 
@@ -1839,7 +2200,7 @@ class StarBot {
 
 
     // Метод для уведомления администратора
-    private async notifyAdminAboutWithdrawal(user: User, amount: number, withdrawalId: number) {
+    private async notifyAdminAboutWithdrawal(user: User, amount: number, withdrawalId: number, referralsCount?: number) {
         try {
             if (this.adminId) {
                 const message =
@@ -1849,6 +2210,7 @@ class StarBot {
                     `👤 Пользователь: ${user.firstName || 'Не указано'}\n` +
                     `🆔 User ID: ${user.telegramId}\n` +
                     `👤 Username: @${user.username || 'Не указан'}\n` +
+                    `👥 Рефералов: ${referralsCount || user.referralsCount || 0}\n` +
                     `⭐ Баланс после списания: ${user.stars}\n` +
                     `📅 Дата: ${new Date().toLocaleString('ru-RU')}\n\n` +
                     `💾 Добавлено в Google Sheets`;
@@ -1884,18 +2246,49 @@ class StarBot {
     private async showWithdrawMenu(ctx: BotContext) {
         try {
             const user = ctx.user!;
-            const minWithdraw = 50;
+            const minWithdraw = 100;
             ctx.waitingForWithdrawAmount = true;
-            const menuText =
-                `💰 *Вывод средств*\n` +
+
+            // Получаем актуальные данные пользователя
+            const userRepository = AppDataSource.getRepository(User);
+            const currentUser = await userRepository.findOne({
+                where: { id: user.id },
+                select: ['stars', 'referralsCount']
+            });
+
+            if (!currentUser) {
+                await ctx.reply('❌ Ошибка загрузки данных пользователя');
+                return;
+            }
+
+            const userStars = currentUser.stars;
+            const userReferrals = currentUser.referralsCount || 0;
+
+            // Проверяем достаточно ли рефералов
+            const hasEnoughReferrals = userReferrals >= this.MIN_REFERRALS_FOR_WITHDRAWAL;
+
+            let menuText = `💰 *Вывод средств*\n` +
                 `═══════════════════\n` +
-                `⭐ Баланс: ${user.stars}\n` +
+                `⭐ Баланс: ${userStars}\n` +
                 `💰 Мин. сумма: ${minWithdraw}\n` +
-                `═══════════════════`;
+                `👥 Рефералов: ${userReferrals} из ${this.MIN_REFERRALS_FOR_WITHDRAWAL} необходимых\n`;
+
+            if (!hasEnoughReferrals) {
+                menuText += `\n⚠️ *Для вывода необходимо пригласить ${this.MIN_REFERRALS_FOR_WITHDRAWAL} друзей*\n` +
+                    `📊 Сейчас: ${userReferrals} из ${this.MIN_REFERRALS_FOR_WITHDRAWAL}\n` +
+                    `👥 Не хватает: ${this.MIN_REFERRALS_FOR_WITHDRAWAL - userReferrals}\n` +
+                    `═══════════════════\n` +
+                    `🎁 За каждого приглашенного друга:\n` +
+                    `• Вы получаете 5⭐\n` +
+                    `• Друг получает 10⭐\n` +
+                    `• Приближаетесь к возможности вывода!`;
+            } else {
+                menuText += `✅ *Достаточно рефералов для вывода*\n` +
+                    `═══════════════════`;
+            }
 
             const keyboard = Markup.inlineKeyboard([
                 [
-                    Markup.button.callback('50 ⭐', 'withdraw_50'),
                     Markup.button.callback('100 ⭐', 'withdraw_100'),
                 ],
                 [
@@ -1905,6 +2298,9 @@ class StarBot {
                 [
                     Markup.button.callback('500 ⭐', 'withdraw_500'),
                     Markup.button.callback('Все ⭐', 'withdraw_all')
+                ],
+                [
+                    Markup.button.callback('👥 Пригласить друзей', 'show_referrals')
                 ],
                 [
                     Markup.button.callback('⬅️ Назад в меню', 'back_to_menu')
@@ -1930,7 +2326,9 @@ class StarBot {
 
 
 
-    private async playAnimatedSlots(ctx: BotContext, betAmount: number) {
+    private async playAnimatedSlots(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
         try {
             let user = ctx.user;
             if (!user) {
@@ -1943,6 +2341,7 @@ class StarBot {
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
@@ -1956,6 +2355,7 @@ class StarBot {
                 }
             }
 
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '🎰' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
@@ -1978,19 +2378,40 @@ class StarBot {
                 }
             }
 
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_slots';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_slots', '🎰', slotValue, betAmount, winAmount, resultText);
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Слоты сохранены в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения слотов в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_slots', '🎰',
+                slotValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedSlots:', error);
-            await ctx.reply('❌ Ошибка в игровых автоматах');
+            console.error(`❌ Error in playAnimatedSlots for user ${userId}:`, error);
+
+            // Не выбрасываем ошибку дальше, чтобы withGameLock мог корректно снять блокировку
+            // Просто логируем и показываем пользователю ошибку
+            try {
+                await ctx.reply('❌ Ошибка в игровых автоматах. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем если не можем отправить
+            }
+
+            // Возвращаем управление (не выбрасываем)
+            return;
         }
     }
 
@@ -2007,17 +2428,17 @@ class StarBot {
 
         // 7️⃣7️⃣7️⃣ - ДЖЕКПОТ (значение 64)
         if (slotsValue === 64) {
-            winMultiplier = 100;
+            winMultiplier = 5;
             resultText = `🎰 7️⃣7️⃣7️⃣`;
         }
         // 🍒 🍒 🍒 (значение 22)
         else if (slotsValue === 22) {
-            winMultiplier = 5;
+            winMultiplier = 1.5;
             resultText = `🎰 🍒🍒🍒`;
         }
         // 🍋 🍋 🍋 (значение 1)
         else if (slotsValue === 1) {
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `🎰`;
         }
         // 🍊 🍊 🍊 (значение 43)
@@ -2055,8 +2476,10 @@ class StarBot {
         };
     }
 
+    private async playGuessGame(ctx: BotContext, chosenNumber: number): Promise<void> {
+        const userId = ctx.from!.id;
+        const betAmount = this.GUESS_GAME_BET;
 
-    private async playAnimatedDice(ctx: BotContext, betAmount: number) {
         try {
             let user = ctx.user;
             if (!user) {
@@ -2064,7 +2487,186 @@ class StarBot {
                 ctx.user = user;
             }
 
-            console.log(`🎲 Игра в кости: пользователь ${user.telegramId}, баланс: ${user.stars}, ставка: ${betAmount}`);
+            console.log(`🎲 Угадайка: пользователь ${userId}, выбрал число ${chosenNumber}, ставка: ${betAmount}`);
+
+            // Проверка баланса (дополнительная, на всякий случай)
+            if (user.stars < betAmount) {
+                await ctx.answerCbQuery(`❌ Недостаточно звезд! Нужно: ${betAmount}`);
+                return;
+            }
+
+            // Списываем ставку
+            user.stars -= betAmount;
+            console.log(`💰 Списано ${betAmount} звезд. Новый баланс: ${user.stars}`);
+
+            const userRepository = AppDataSource.getRepository(User);
+            await userRepository.save(user);
+
+            // Немедленно обновляем Google Sheets
+            if (this.googleSheets) {
+                try {
+                    await this.scheduleSheetsUpdate(user);
+                } catch (sheetError) {
+                    console.error('❌ Ошибка обновления таблицы после списания:', sheetError);
+                }
+            }
+
+            // Отправляем анимацию кубика
+            const animation = await ctx.replyWithDice({ emoji: '🎲' });
+            await new Promise(resolve => setTimeout(resolve, 4000));
+
+            const diceValue = animation.dice.value;
+            console.log(`🎲 Выпало: ${diceValue}, пользователь выбрал: ${chosenNumber}`);
+
+            // Определяем выигрыш
+            let winAmount = 0;
+            let resultText = '';
+            let isWin = false;
+
+            if (diceValue === chosenNumber) {
+                // УГАДАЛ! Выигрыш x2
+                winAmount = betAmount * 3;
+                isWin = true;
+
+                resultText = `Вы угадали число ${diceValue}`;
+                // ...
+            } else {
+                // НЕ УГАДАЛ
+                isWin = false;
+
+                resultText = `Вы выбрали: ${chosenNumber}\nВыпало: ${diceValue}`;
+                // ...
+            }
+
+            // Сохраняем игру в БД
+            const game = new Game();
+            game.userId = user.telegramId;
+            game.gameType = 'guess_dice';
+            game.betAmount = betAmount;
+            game.winAmount = winAmount;
+            game.result = isWin ? 'win' : 'loss';
+
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Угадайка сохранена в БД для пользователя ${userId}: ${isWin ? 'выигрыш' : 'проигрыш'} ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения угадайки в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showGuessGameResult(ctx, user, diceValue, chosenNumber, betAmount, winAmount, resultText, isWin);
+
+        } catch (error: any) {
+            console.error(`❌ Error in playGuessGame for user ${userId}:`, error);
+
+            try {
+                await ctx.answerCbQuery('❌ Ошибка в игре');
+                await ctx.reply('❌ Ошибка в игре "Угадайка". Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем
+            }
+
+            return;
+        }
+    }
+    private async showGuessGameResult(
+        ctx: BotContext,
+        user: User,
+        diceValue: number,
+        chosenNumber: number,
+        betAmount: number,
+        winAmount: number,
+        resultText: string,
+        isWin: boolean
+    ): Promise<void> {
+        try {
+            const diceEmojis = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
+            const diceEmoji = diceEmojis[diceValue] || '🎲';
+
+            // Определяем эмодзи результата как в других играх
+            let resultEmoji = '';
+            let resultTitle = '';
+
+            if (isWin) {
+                if (winAmount > betAmount * 1.5) {
+                    resultEmoji = '💰';
+                    resultTitle = '*БОЛЬШОЙ ВЫИГРЫШ!*';
+                } else {
+                    resultEmoji = '🎉';
+                    resultTitle = '*ВЫ ВЫИГРАЛИ!*';
+                }
+            } else {
+                resultEmoji = '😔';
+                resultTitle = '*Попробуйте еще раз*';
+            }
+
+            const message =
+                `🎲 *Угадай число*\n` +
+                `═══════════════════\n` +
+                `${resultEmoji} ${resultTitle}\n` +
+                `Вы выбрали: ${chosenNumber}\n` +
+                `Выпало: ${diceValue} ${diceEmoji}\n\n` +
+                `💰 *Ставка:* ${betAmount} ⭐\n` +
+                `🏆 *Выигрыш:* ${winAmount} ⭐\n` +
+                `⭐ *Баланс:* ${user.stars} ⭐\n` +
+                `═══════════════════`;
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🎲 Играть еще', callback_data: 'play_animated_guess' },
+                        { text: '🎮 Другие игры', callback_data: 'other_game' }
+                    ],
+                    [
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]
+                ]
+            };
+
+            // Удаляем старое сообщение с меню выбора
+            if (ctx.callbackQuery?.message) {
+                try {
+                    await ctx.deleteMessage();
+                } catch (deleteError) {
+                    console.log('⚠️ Cannot delete message, continuing...');
+                }
+            }
+
+            // Отправляем результат как новое сообщение
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+            });
+
+        } catch (error: any) {
+            console.error('❌ Error showing guess game result:', error);
+
+            // Упрощенный вариант в случае ошибки
+            try {
+                await ctx.reply(
+                    `🎲 *Угадай число*\n\n` +
+                    `${isWin ? '🎉 Поздравляем! Вы угадали!' : '😔 Не угадали'}\n` +
+                    `Выбрали: ${chosenNumber}, выпало: ${diceValue}\n` +
+                    `Выигрыш: ${winAmount} ⭐\n` +
+                    `Баланс: ${user.stars} ⭐`,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (e) {
+                // Игнорируем
+            }
+        }
+    }
+    private async playAnimatedDice(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
+        try {
+            let user = ctx.user;
+            if (!user) {
+                user = await this.getUser(ctx.from!.id);
+                ctx.user = user;
+            }
+
+            console.log(`🎲 Игра в кости: пользователь ${userId}, баланс: ${user.stars}, ставка: ${betAmount}`);
 
             if (user.stars < betAmount) {
                 await ctx.reply(`❌ Недостаточно звезд! Нужно: ${betAmount}, у вас: ${user.stars}`);
@@ -2075,7 +2677,6 @@ class StarBot {
             user.stars -= betAmount;
             console.log(`💰 Списано ${betAmount} звезд. Новый баланс: ${user.stars}`);
 
-            // Сохраняем пользователя
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
 
@@ -2113,18 +2714,9 @@ class StarBot {
                         console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
                     }
                 }
-            }
-
-            // Сохраняем пользователя с выигрышем
-            await userRepository.save(user);
-
-            // Снова обновляем Google Sheets с новым балансом
-            if (this.googleSheets && winAmount > 0) {
-                try {
-                    await this.scheduleSheetsUpdate(user);
-                } catch (sheetError) {
-                    console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
-                }
+            } else {
+                // Если проиграл, всё равно сохраняем пользователя для обновления баланса
+                await userRepository.save(user);
             }
 
             // Сохраняем игру в БД
@@ -2137,16 +2729,28 @@ class StarBot {
 
             try {
                 await AppDataSource.getRepository(Game).save(game);
-                console.log(`💾 Игра сохранена в БД: ${game.id}`);
+                console.log(`💾 Кости сохранены в БД для пользователя ${userId}: выигрыш ${winAmount}`);
             } catch (gameError) {
                 console.error('❌ Ошибка сохранения игры в БД:', gameError);
             }
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_dice', '🎲', diceValue, betAmount, winAmount, resultText);
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_dice', '🎲',
+                diceValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedDice:', error);
-            await ctx.reply('❌ Ошибка в игре в кости');
+            console.error(`❌ Error in playAnimatedDice for user ${userId}:`, error);
+
+            try {
+                await ctx.reply('❌ Ошибка в игре в кости. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем если не можем отправить
+            }
+
+            // Возвращаем управление (не выбрасываем)
+            return;
         }
     }
 
@@ -2158,11 +2762,11 @@ class StarBot {
 
         if (diceValue === 6) {
             // Максимальное значение - наибольший выигрыш
-            winMultiplier = 3;
+            winMultiplier = 2;
             resultText = `🎲 *ШЕСТЕРКА!* Максимальный результат! ${diceEmoji}`;
         } else if (diceValue === 5) {
             // 5 очков - очень хорошо
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `🎲 *Отлично!* 5 очков ${diceEmoji}`;
         } else if (diceValue === 4) {
             // 4 очка - хорошо
@@ -2189,7 +2793,9 @@ class StarBot {
         };
     }
 
-    private async playAnimatedDarts(ctx: BotContext, betAmount: number) {
+    private async playAnimatedDarts(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
         try {
             let user = ctx.user;
             if (!user) {
@@ -2202,6 +2808,7 @@ class StarBot {
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
@@ -2215,6 +2822,7 @@ class StarBot {
                 }
             }
 
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '🎯' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
@@ -2235,21 +2843,42 @@ class StarBot {
                         console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
                     }
                 }
+            } else {
+                // Если проиграл, всё равно сохраняем пользователя
+                await userRepository.save(user);
             }
 
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_darts';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_darts', '🎯', dartsValue, betAmount, winAmount, resultText);
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Дартс сохранены в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения дартс в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_darts', '🎯',
+                dartsValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedDarts:', error);
-            await ctx.reply('❌ Ошибка в игре в дартс');
+            console.error(`❌ Error in playAnimatedDarts for user ${userId}:`, error);
+
+            try {
+                await ctx.reply('❌ Ошибка в игре в дартс. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем
+            }
+
+            return;
         }
     }
 
@@ -2259,15 +2888,15 @@ class StarBot {
 
         if (dartsValue === 6) {
             // Яблочко - максимальный выигрыш
-            winMultiplier = 3; // можно увеличить до 10, если хотите больше награды
+            winMultiplier = 2; // можно увеличить до 10, если хотите больше награды
             resultText = `🎯 *В ЯБЛОЧКО!* Идеальное попадание!`;
         } else if (dartsValue === 5) {
             // Близко к центру
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `🎯 *Очень близко!* Почти в яблочко`;
         } else if (dartsValue === 4) {
             // Внутреннее кольцо
-            winMultiplier = 1.5;
+            winMultiplier = 1;
             resultText = `🎯 *Хороший бросок!* Внутреннее кольцо`;
         } else if (dartsValue === 3) {
             // Среднее кольцо
@@ -2291,7 +2920,9 @@ class StarBot {
 
 
 
-    private async playAnimatedBasketball(ctx: BotContext, betAmount: number) {
+    private async playAnimatedBasketball(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
         try {
             let user = ctx.user;
             if (!user) {
@@ -2304,6 +2935,7 @@ class StarBot {
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
@@ -2317,6 +2949,7 @@ class StarBot {
                 }
             }
 
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '🏀' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
@@ -2334,24 +2967,45 @@ class StarBot {
                     try {
                         await this.scheduleSheetsUpdate(user);
                     } catch (sheetError) {
-                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                        console.error('❌ Ошибка обновления таблицы после выигрыш:', sheetError);
                     }
                 }
+            } else {
+                // Если проиграл, всё равно сохраняем пользователя
+                await userRepository.save(user);
             }
 
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_basketball';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_basketball', '🏀', basketballValue, betAmount, winAmount, resultText);
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Баскетбол сохранен в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения баскетбола в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_basketball', '🏀',
+                basketballValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedBasketball:', error);
-            await ctx.reply('❌ Ошибка в игре в баскетбол');
+            console.error(`❌ Error in playAnimatedBasketball for user ${userId}:`, error);
+
+            try {
+                await ctx.reply('❌ Ошибка в игре в баскетбол. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем
+            }
+
+            return;
         }
     }
 
@@ -2361,15 +3015,15 @@ class StarBot {
 
         if (basketballValue === 5) {
             // Сверхдальний бросок/трехочковый
-            winMultiplier = 3; // можно оставить 8, если хотите большую награду
+            winMultiplier = 2; // можно оставить 8, если хотите большую награду
             resultText = `🏀 *СВЕРХДАЛЬНИЙ БРОСОК!* Трехочковый!`;
         } else if (basketballValue === 4) {
             // Средний бросок
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `🏀 *Красивый бросок!* Попадание со средней дистанции`;
         } else if (basketballValue === 3) {
             // Ближний бросок
-            winMultiplier = 0; // или 2, если хотите
+            winMultiplier = 1; // или 2, если хотите
             resultText = `🏀 *Попадание!* Ближний бросок`;
         } else if (basketballValue === 2) {
             // Удар о щиток - НЕ ВЫИГРЫШ
@@ -2387,7 +3041,9 @@ class StarBot {
         };
     }
 
-    private async playAnimatedFootball(ctx: BotContext, betAmount: number) {
+    private async playAnimatedFootball(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
         try {
             let user = ctx.user;
             if (!user) {
@@ -2400,6 +3056,7 @@ class StarBot {
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
@@ -2413,6 +3070,7 @@ class StarBot {
                 }
             }
 
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '⚽' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
@@ -2430,24 +3088,45 @@ class StarBot {
                     try {
                         await this.scheduleSheetsUpdate(user);
                     } catch (sheetError) {
-                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                        console.error('❌ Ошибка обновления таблицы после выигрыш:', sheetError);
                     }
                 }
+            } else {
+                // Если проиграл, всё равно сохраняем пользователя
+                await userRepository.save(user);
             }
 
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_football';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_football', '⚽', footballValue, betAmount, winAmount, resultText);
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Футбол сохранен в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения футбола в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_football', '⚽',
+                footballValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedFootball:', error);
-            await ctx.reply('❌ Ошибка в игре в футбол');
+            console.error(`❌ Error in playAnimatedFootball for user ${userId}:`, error);
+
+            try {
+                await ctx.reply('❌ Ошибка в игре в футбол. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем
+            }
+
+            return;
         }
     }
 
@@ -2457,11 +3136,11 @@ class StarBot {
 
         if (footballValue === 5) {
             // Самый верхний угол - идеальный гол
-            winMultiplier = 3; // можно оставить 8 для большей награды
+            winMultiplier = 2; // можно оставить 8 для большей награды
             resultText = `⚽ *ИДЕАЛЬНЫЙ ГОЛ!* Верхний угол!`;
         } else if (footballValue === 4) {
             // Верхний угол - отличный гол
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `⚽ *ВЕРХНИЙ УГОЛ!* Отличный удар!`;
         } else if (footballValue === 3) {
             // Попадание в ворота - обычный гол
@@ -2483,7 +3162,9 @@ class StarBot {
         };
     }
 
-    private async playAnimatedBowling(ctx: BotContext, betAmount: number) {
+    private async playAnimatedBowling(ctx: BotContext, betAmount: number): Promise<void> {
+        const userId = ctx.from!.id;
+
         try {
             let user = ctx.user;
             if (!user) {
@@ -2496,6 +3177,7 @@ class StarBot {
                 return;
             }
 
+            // Списываем ставку
             user.stars -= betAmount;
             const userRepository = AppDataSource.getRepository(User);
             await userRepository.save(user);
@@ -2509,6 +3191,7 @@ class StarBot {
                 }
             }
 
+            // Отправляем анимацию
             const animation = await ctx.replyWithDice({ emoji: '🎳' });
             await new Promise(resolve => setTimeout(resolve, 4000));
 
@@ -2526,24 +3209,45 @@ class StarBot {
                     try {
                         await this.scheduleSheetsUpdate(user);
                     } catch (sheetError) {
-                        console.error('❌ Ошибка обновления таблицы после выигрыша:', sheetError);
+                        console.error('❌ Ошибка обновления таблицы после выигрыш:', sheetError);
                     }
                 }
+            } else {
+                // Если проиграл, всё равно сохраняем пользователя
+                await userRepository.save(user);
             }
 
+            // Сохраняем игру в БД
             const game = new Game();
             game.userId = user.telegramId;
             game.gameType = 'animated_bowling';
             game.betAmount = betAmount;
             game.winAmount = winAmount;
             game.result = winAmount > 0 ? 'win' : 'loss';
-            await AppDataSource.getRepository(Game).save(game);
 
-            await this.showAnimatedGameResult(ctx, user, 'animated_bowling', '🎳', bowlingValue, betAmount, winAmount, resultText);
+            try {
+                await AppDataSource.getRepository(Game).save(game);
+                console.log(`💾 Боулинг сохранен в БД для пользователя ${userId}: выигрыш ${winAmount}`);
+            } catch (gameError) {
+                console.error('❌ Ошибка сохранения боулинга в БД:', gameError);
+            }
+
+            // Показываем результат
+            await this.showAnimatedGameResult(
+                ctx, user, 'animated_bowling', '🎳',
+                bowlingValue, betAmount, winAmount, resultText
+            );
 
         } catch (error: any) {
-            console.error('❌ Error in playAnimatedBowling:', error);
-            await ctx.reply('❌ Ошибка в игре в боулинг');
+            console.error(`❌ Error in playAnimatedBowling for user ${userId}:`, error);
+
+            try {
+                await ctx.reply('❌ Ошибка в игре в боулинг. Попробуйте позже.');
+            } catch (e) {
+                // Игнорируем
+            }
+
+            return;
         }
     }
 
@@ -2553,11 +3257,11 @@ class StarBot {
 
         if (bowlingValue === 6) {
             // Страйк - все кегли сбиты
-            winMultiplier = 3; // уменьшил с 12 для баланса
+            winMultiplier = 2; // уменьшил с 12 для баланса
             resultText = `🎳 *СТРАЙК!* Все кегли сбиты! ${bowlingValue}/6`;
         } else if (bowlingValue === 5) {
             // Почти страйк - 5 кеглей
-            winMultiplier = 2;
+            winMultiplier = 1.5;
             resultText = `🎳 *Почти страйк!* 5 кеглей ${bowlingValue}/6`;
         } else if (bowlingValue === 4) {
             // Хороший бросок - 4 кегли
@@ -2608,7 +3312,8 @@ class StarBot {
             'animated_darts': '🎯 Дартс',
             'animated_basketball': '🏀 Баскетбол',
             'animated_football': '⚽ Футбол',
-            'animated_bowling': '🎳 Боулинг'
+            'animated_bowling': '🎳 Боулинг',
+            'guess_dice': '🎲 Угадайка'
         };
 
         const gameName = gameNames[gameType] || gameType;
@@ -3039,9 +3744,9 @@ class StarBot {
 
                 if (referrer) {
                     // Начисляем бонус рефереру
-                    referrer.stars += 3;
+                    referrer.stars += 5;
                     referrer.referralsCount = (referrer.referralsCount || 0) + 1;
-                    referrer.totalEarned += 3;
+                    referrer.totalEarned += 5;
 
                     await referrerRepository.save(referrer);
 
@@ -3059,7 +3764,7 @@ class StarBot {
                         await this.bot.telegram.sendMessage(
                             referrer.telegramId,
                             `🎉 *По вашей ссылке зарегистрировался новый пользователь!*\n\n` +
-                            `✅ Вам начислено: +3 ⭐\n` +
+                            `✅ Вам начислено: +5 ⭐\n` +
                             `👤 Приглашенный: ${user.firstName || 'Новый пользователь'}\n` +
                             `📊 Ваш баланс: ${referrer.stars} ⭐\n` +
                             `👥 Всего приглашено: ${referrer.referralsCount} друзей`,
@@ -3079,7 +3784,7 @@ class StarBot {
             if (user.referrerId) {
                 successMessage += `🎁 *Реферальный бонус:*\n` +
                     `• Вы получили: 10 ⭐\n` +
-                    `• Пригласивший получил: 3 ⭐\n\n`;
+                    `• Пригласивший получил: 5 ⭐\n\n`;
             }
 
             successMessage += `📊 Баланс: ${user.stars} ⭐\n\n` +
