@@ -287,6 +287,33 @@ class StarBot {
             console.log(`🧹 Total cleared locks: ${cleared}`);
         }
     }
+    async safeEditMessage(ctx, newText, keyboard) {
+        try {
+            if (!ctx.callbackQuery?.message)
+                return false;
+            // Получаем текущий текст сообщения
+            const currentMessage = ctx.callbackQuery.message;
+            const currentText = 'text' in currentMessage ? currentMessage.text : '';
+            // Проверяем, изменился ли текст
+            if (currentText === newText) {
+                await ctx.answerCbQuery('✅ Уже актуально');
+                return false;
+            }
+            // Если текст изменился - редактируем
+            await ctx.editMessageText(newText, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+            });
+            return true;
+        }
+        catch (error) {
+            if (error.response?.description?.includes('message is not modified')) {
+                await ctx.answerCbQuery('✅ Уже актуально');
+                return false;
+            }
+            throw error;
+        }
+    }
     // 1. Метод для показа списка заданий
     async showTasksMenu(ctx) {
         try {
@@ -298,10 +325,41 @@ class StarBot {
                 .where('task.status = :status', { status: 'active' })
                 .andWhere('task.isAvailable = :available', { available: true })
                 .getMany();
+            console.log(`📊 Найдено активных заданий: ${allTasks.length}`);
+            // ЕСЛИ ЗАДАНИЙ НЕТ - отображаем специальное сообщение
             if (allTasks.length === 0) {
-                await this.sendTaskMenu(ctx, '📋 *Задания*\n\n' +
+                const noTasksMessage = '📋 *Задания*\n\n' +
                     'На данный момент нет доступных заданий.\n' +
-                    'Задания появляются регулярно, следите за обновлениями!');
+                    'Задания появляются регулярно, следите за обновлениями!';
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Обновить', callback_data: 'refresh_tasks' },
+                            { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                        ]
+                    ]
+                };
+                if (ctx.callbackQuery) {
+                    try {
+                        await ctx.editMessageText(noTasksMessage, {
+                            parse_mode: 'Markdown',
+                            reply_markup: keyboard
+                        });
+                        await ctx.answerCbQuery('🔄 Обновлено');
+                    }
+                    catch (editError) {
+                        if (!editError.response?.description?.includes('message is not modified')) {
+                            throw editError;
+                        }
+                        await ctx.answerCbQuery('✅ Уже актуально');
+                    }
+                }
+                else {
+                    await ctx.reply(noTasksMessage, {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                }
                 return;
             }
             // Получаем ВЫПОЛНЕННЫЕ задания пользователя
@@ -323,22 +381,60 @@ class StarBot {
             let availableTasks = allTasks.filter(task => !completedTaskIds.includes(task.id));
             // Если пользователь уже выполнил ВСЕ задания
             if (availableTasks.length === 0) {
-                const totalReward = completedTasks.reduce((sum, ut) => {
-                    const task = allTasks.find(t => t.id === ut.taskId);
-                    return sum + (task?.reward || 0);
-                }, 0);
-                await this.sendTaskMenu(ctx, '🎉 *Поздравляем!*\n\n' +
+                // Рассчитываем общую награду
+                let totalReward = 0;
+                for (const completedTask of completedTasks) {
+                    const task = allTasks.find(t => t.id === completedTask.taskId);
+                    if (task) {
+                        totalReward += task.reward;
+                    }
+                }
+                const allDoneMessage = '🎉 *Поздравляем!*\n\n' +
                     'Вы выполнили все доступные задания!\n\n' +
-                    '📋 *Выполнено заданий:* ' + completedTasks.length + '\n' +
-                    '💰 *Всего заработано:* ' + totalReward + ' ⭐\n\n' +
+                    `📋 *Выполнено заданий:* ${completedTasks.length}\n` +
+                    `💰 *Всего заработано:* ${totalReward} ⭐\n\n` +
                     '🔄 Новые задания появляются регулярно.\n' +
-                    'Возвращайтесь позже за новыми заданиями!');
+                    'Возвращайтесь позже за новыми заданиями!';
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '📊 Моя статистика', callback_data: 'my_tasks' },
+                            { text: '🔄 Проверить обновления', callback_data: 'refresh_tasks' }
+                        ],
+                        [
+                            { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                        ]
+                    ]
+                };
+                if (ctx.callbackQuery) {
+                    try {
+                        await ctx.editMessageText(allDoneMessage, {
+                            parse_mode: 'Markdown',
+                            reply_markup: keyboard
+                        });
+                        await ctx.answerCbQuery('🎉 Все задания выполнены!');
+                    }
+                    catch (editError) {
+                        if (!editError.response?.description?.includes('message is not modified')) {
+                            throw editError;
+                        }
+                        await ctx.answerCbQuery('✅ Уже актуально');
+                    }
+                }
+                else {
+                    await ctx.reply(allDoneMessage, {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                }
                 return;
             }
             // Выбираем ОДНО случайное задание из доступных
-            const randomTask = availableTasks[Math.floor(Math.random() * availableTasks.length)];
-            // Проверяем, есть ли уже запись об этом задании у пользователя
-            const existingUserTask = await data_source_1.AppDataSource.getRepository(UserTask_1.UserTask).findOne({
+            const randomIndex = Math.floor(Math.random() * availableTasks.length);
+            const randomTask = availableTasks[randomIndex];
+            // Проверяем, есть ли уже запись об этом задании у пользователя (в процессе выполнения)
+            const userTaskRepository = data_source_1.AppDataSource.getRepository(UserTask_1.UserTask);
+            const existingUserTask = await userTaskRepository.findOne({
                 where: {
                     userId: user.id,
                     taskId: randomTask.id,
@@ -350,7 +446,7 @@ class StarBot {
             // Если задание уже в процессе выполнения (ожидание)
             if (existingUserTask) {
                 message = `⏳ *Задание уже в процессе выполнения*\n\n`;
-                message += `🎯 *${randomTask.title}*\n`;
+                message += `🎯 **${randomTask.title}**\n`;
                 message += `📝 ${randomTask.description}\n\n`;
                 // Рассчитываем оставшееся время
                 const now = new Date();
@@ -362,7 +458,7 @@ class StarBot {
                 keyboard = {
                     inline_keyboard: [
                         [
-                            { text: '🔄 Проверить другие задания', callback_data: 'show_tasks' },
+                            { text: '🔄 Получить другое задание', callback_data: 'refresh_tasks' },
                             { text: '📊 Моя статистика', callback_data: 'my_tasks' }
                         ],
                         [
@@ -373,24 +469,24 @@ class StarBot {
             }
             else {
                 // Новое задание для пользователя
-                // Создаем запись о начале выполнения задания
-                const userTaskRepo = data_source_1.AppDataSource.getRepository(UserTask_1.UserTask);
-                const newUserTask = userTaskRepo.create({
-                    userId: user.id,
-                    taskId: randomTask.id,
-                    status: 'pending',
-                    clickTime: new Date(),
-                    completionTime: new Date(Date.now() + 2 * 60 * 1000) // +2 минуты для реферальных заданий
-                });
-                await userTaskRepo.save(newUserTask);
+                // Создаем запись о начале выполнения задания (если это не реферальное задание с переходом по ссылке)
+                if (randomTask.type !== 'referral_click') {
+                    const newUserTask = userTaskRepository.create({
+                        userId: user.id,
+                        taskId: randomTask.id,
+                        status: 'pending',
+                        clickTime: new Date(),
+                        completionTime: new Date(Date.now() + 2 * 60 * 1000) // +2 минуты
+                    });
+                    await userTaskRepository.save(newUserTask);
+                }
                 message = `🎯 *Новое задание для вас!*\n\n`;
                 message += `**${randomTask.title}**\n`;
                 message += `📝 ${randomTask.description}\n\n`;
                 message += `💰 *Награда:* ${randomTask.reward} ⭐\n`;
-                message += `⏰ *Время на выполнение:* 2 минуты\n\n`;
                 // Добавляем информацию в зависимости от типа задания
                 if (randomTask.type === 'channel_subscription' && randomTask.channelUsername) {
-                    message += `📢 *Как выполнить:*\n`;
+                    message += `⏰ *Как выполнить:*\n`;
                     message += `1. Подпишитесь на канал ${randomTask.channelUsername}\n`;
                     message += `2. Нажмите кнопку "Проверить подписку" ниже\n\n`;
                     keyboard = {
@@ -408,7 +504,7 @@ class StarBot {
                                 }
                             ],
                             [
-                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '🔄 Другое задание', callback_data: 'refresh_tasks' },
                                 { text: '📊 Статистика', callback_data: 'my_tasks' }
                             ],
                             [
@@ -421,7 +517,7 @@ class StarBot {
                     // Генерируем уникальную ссылку с ID клика
                     const clickId = this.generateClickId(user.id, randomTask.id);
                     const trackingUrl = `${randomTask.targetUrl}?ref=${clickId}&user=${user.telegramId}`;
-                    message += `🔗 *Как выполнить:*\n`;
+                    message += `⏰ *Как выполнить:*\n`;
                     message += `1. Перейдите по специальной ссылке\n`;
                     message += `2. Оставайтесь на сайте 2 минуты\n`;
                     message += `3. Получите награду автоматически\n\n`;
@@ -437,7 +533,7 @@ class StarBot {
                                 }
                             ],
                             [
-                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '🔄 Другое задание', callback_data: 'refresh_tasks' },
                                 { text: '📊 Статистика', callback_data: 'my_tasks' }
                             ],
                             [
@@ -447,7 +543,7 @@ class StarBot {
                     };
                 }
                 else if (randomTask.type === 'bot_subscription' && randomTask.botUsername) {
-                    message += `🤖 *Как выполнить:*\n`;
+                    message += `⏰ *Как выполнить:*\n`;
                     message += `1. Подпишитесь на бота ${randomTask.botUsername}\n`;
                     message += `2. Нажмите кнопку "Проверить подписку" ниже\n\n`;
                     keyboard = {
@@ -465,7 +561,7 @@ class StarBot {
                                 }
                             ],
                             [
-                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '🔄 Другое задание', callback_data: 'refresh_tasks' },
                                 { text: '📊 Статистика', callback_data: 'my_tasks' }
                             ],
                             [
@@ -475,14 +571,16 @@ class StarBot {
                     };
                 }
                 else {
-                    // Общий случай
+                    // Общий случай для других типов заданий
+                    message += `⏰ *Как выполнить:*\n`;
+                    message += `Следуйте инструкциям выше\n\n`;
                     keyboard = {
                         inline_keyboard: [
                             [
                                 { text: '🎯 Выполнить задание', callback_data: `show_task_${randomTask.id}` }
                             ],
                             [
-                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '🔄 Другое задание', callback_data: 'refresh_tasks' },
                                 { text: '📊 Статистика', callback_data: 'my_tasks' }
                             ],
                             [
@@ -492,12 +590,19 @@ class StarBot {
                     };
                 }
             }
-            // Добавляем информацию о доступных заданиях
+            // Добавляем статистическую информацию
             message += `\n──────────────\n`;
-            message += `📊 *Доступно заданий:* ${availableTasks.length}\n`;
-            message += `✅ *Выполнено:* ${completedTasks.length}\n`;
+            message += `📊 *Статистика:*\n`;
+            message += `• Доступно заданий: ${availableTasks.length}\n`;
+            message += `• Выполнено: ${completedTasks.length}\n`;
             if (pendingTasks.length > 0) {
-                message += `⏳ *В процессе:* ${pendingTasks.length}\n`;
+                message += `• В процессе: ${pendingTasks.length}\n`;
+            }
+            message += `• Всего заданий в системе: ${allTasks.length}\n`;
+            message += `──────────────\n`;
+            if (!existingUserTask) {
+                message += `💡 *Важно:* Выполняйте по одному заданию за раз.\n`;
+                message += `После завершения получите следующее.`;
             }
             if (ctx.callbackQuery) {
                 try {
@@ -509,7 +614,15 @@ class StarBot {
                 }
                 catch (editError) {
                     if (!editError.response?.description?.includes('message is not modified')) {
-                        throw editError;
+                        console.error('❌ Error editing message:', editError);
+                        // Пытаемся отправить новое сообщение
+                        await ctx.reply(message, {
+                            parse_mode: 'Markdown',
+                            reply_markup: keyboard
+                        });
+                    }
+                    else {
+                        await ctx.answerCbQuery('✅ Уже актуально');
                     }
                 }
             }
@@ -521,25 +634,32 @@ class StarBot {
             }
         }
         catch (error) {
-            console.error('❌ Error showing single task:', error);
-            await ctx.reply('❌ *Ошибка при загрузке задания*\n\n' +
-                'Попробуйте еще раз через несколько секунд.', {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '🔄 Попробовать снова', callback_data: 'show_tasks' },
-                            { text: '🏠 В меню', callback_data: 'back_to_menu' }
+            console.error('❌ Error showing tasks menu:', error);
+            // Упрощенный ответ при ошибке
+            try {
+                await ctx.reply('❌ *Ошибка при загрузке задания*\n\n' +
+                    'Попробуйте еще раз через несколько секунд.', {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '🔄 Попробовать снова', callback_data: 'refresh_tasks' },
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
                         ]
-                    ]
-                }
-            });
+                    }
+                });
+            }
+            catch (replyError) {
+                console.error('❌ Error sending error message:', replyError);
+            }
         }
     }
     async getNextTaskForUser(userId) {
         try {
             // Получаем все активные задания
-            const allTasks = await data_source_1.AppDataSource.getRepository(Task_1.Task)
+            const taskRepository = data_source_1.AppDataSource.getRepository(Task_1.Task);
+            const allTasks = await taskRepository
                 .createQueryBuilder('task')
                 .where('task.status = :status', { status: 'active' })
                 .andWhere('task.isAvailable = :available', { available: true })
@@ -547,23 +667,23 @@ class StarBot {
             if (allTasks.length === 0)
                 return null;
             // Получаем выполненные задания пользователя
-            const completedTasks = await data_source_1.AppDataSource.getRepository(UserTask_1.UserTask)
+            const userTaskRepository = data_source_1.AppDataSource.getRepository(UserTask_1.UserTask);
+            const completedTasks = await userTaskRepository
                 .createQueryBuilder('userTask')
-                .where('userTask.userId = :userId', { userId: userId })
+                .where('userTask.userId = :userId', { userId })
                 .andWhere('userTask.status = :status', { status: 'completed' })
                 .getMany();
             // Получаем задания в процессе выполнения
-            const pendingTasks = await data_source_1.AppDataSource.getRepository(UserTask_1.UserTask)
+            const pendingTasks = await userTaskRepository
                 .createQueryBuilder('userTask')
-                .where('userTask.userId = :userId', { userId: userId })
+                .where('userTask.userId = :userId', { userId })
                 .andWhere('userTask.status = :status', { status: 'pending' })
                 .getMany();
             // Находим задания, которые пользователь еще не начинал
-            const completedAndPendingIds = [
-                ...completedTasks.map(ut => ut.taskId),
-                ...pendingTasks.map((ut) => ut.taskId) // Добавляем тип
-            ];
-            const availableTasks = allTasks.filter(task => !completedAndPendingIds.includes(task.id));
+            const completedTaskIds = completedTasks.map(ut => ut.taskId);
+            const pendingTaskIds = pendingTasks.map(ut => ut.taskId);
+            const allUsedTaskIds = [...completedTaskIds, ...pendingTaskIds];
+            const availableTasks = allTasks.filter(task => !allUsedTaskIds.includes(task.id));
             if (availableTasks.length === 0)
                 return null;
             // Выбираем случайное задание
@@ -586,10 +706,27 @@ class StarBot {
                 ]
             };
             if (ctx.callbackQuery) {
-                await ctx.editMessageText(message, {
-                    parse_mode: 'Markdown',
-                    reply_markup: keyboard
-                });
+                try {
+                    // Пытаемся отредактировать сообщение
+                    await ctx.editMessageText(message, {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                }
+                catch (editError) {
+                    // Если ошибка "message is not modified", просто подтверждаем нажатие кнопки
+                    if (editError.response?.description?.includes('message is not modified')) {
+                        await ctx.answerCbQuery('✅ Уже актуально');
+                    }
+                    else {
+                        // Если другая ошибка - отправляем новое сообщение
+                        console.error('❌ Error editing message:', editError);
+                        await ctx.reply(message, {
+                            parse_mode: 'Markdown',
+                            reply_markup: keyboard
+                        });
+                    }
+                }
             }
             else {
                 await ctx.reply(message, {
@@ -1792,8 +1929,23 @@ class StarBot {
             await this.showTasksMenu(ctx);
         });
         this.bot.action('refresh_tasks', async (ctx) => {
-            await ctx.answerCbQuery('🔄 Загружаю новые задания...');
-            await this.showTasksMenu(ctx);
+            try {
+                // Сначала подтверждаем нажатие
+                await ctx.answerCbQuery('🔄 Ищу новые задания...');
+                // Ждем немного перед показом
+                await new Promise(resolve => setTimeout(resolve, 500));
+                // Показываем задания
+                await this.showTasksMenu(ctx);
+            }
+            catch (error) {
+                console.error('❌ Error in refresh_tasks handler:', error);
+                try {
+                    await ctx.answerCbQuery('❌ Ошибка при обновлении');
+                }
+                catch (e) {
+                    // Игнорируем
+                }
+            }
         });
         // Или добавьте отдельный обработчик для рандомного обновления:
         this.bot.action('refresh_tasks_random', async (ctx) => {
