@@ -211,7 +211,8 @@ class StarBot {
                 { command: 'balance', description: '💰 Мой баланс' },
                 { command: 'withdraw', description: '💳 Вывод средств' }, // ← Добавлено
                 { command: 'referral', description: '👥 Звёзды за друзей' },
-                { command: 'help', description: '❓ Помощь' }
+                { command: 'help', description: '❓ Помощь' },
+                { command: 'tasks', description: '🎯 Задания' }
             ];
 
             await this.bot.telegram.setMyCommands(commands);
@@ -552,12 +553,17 @@ class StarBot {
                         ]
                     };
                 } else if (randomTask.type === 'referral_click' && randomTask.targetUrl) {
-                    // Генерируем уникальную ссылку с ID клика
+                    // ИСПРАВЛЕННЫЙ БЛОК: Используем оригинальную ссылку без изменений
+                    const originalUrl = randomTask.targetUrl;
+
+                    // Генерируем уникальный ID для отслеживания
                     const clickId = this.generateClickId(user.id, randomTask.id);
-                    const trackingUrl = `${randomTask.targetUrl}?ref=${clickId}&user=${user.telegramId}`;
+
+                    console.log(`🔗 Используем оригинальный URL: ${originalUrl}`);
+                    console.log(`🔗 Click ID для отслеживания: ${clickId}`);
 
                     message += `⏰ *Как выполнить:*\n`;
-                    message += `1. Перейдите по специальной ссылке\n`;
+                    message += `1. Перейдите по ссылке ниже\n`;
                     message += `2. Оставайтесь на сайте 2 минуты\n`;
                     message += `3. Получите награду автоматически\n\n`;
                     message += `⚠️ *Важно:* Не закрывайте сайт раньше времени!`;
@@ -570,7 +576,7 @@ class StarBot {
                             [
                                 {
                                     text: `🔗 Перейти по ссылке (+${randomTask.reward}⭐)`,
-                                    url: trackingUrl
+                                    url: originalUrl  // ← ИСПОЛЬЗУЕМ ОРИГИНАЛЬНУЮ ССЫЛКУ
                                 }
                             ],
                             [
@@ -702,6 +708,7 @@ class StarBot {
         }
     }
 
+
     private async getNextTaskForUser(userId: number): Promise<Task | null> {
         try {
             // Получаем все активные задания
@@ -791,7 +798,11 @@ class StarBot {
             await ctx.reply('❌ Ошибка отображения меню заданий.');
         }
     }
-
+    private async buildTrackingUrl(originalUrl: string, clickId: string, userId: number): Promise<string> {
+        // Просто возвращаем оригинальную ссылку без изменений
+        console.log(`🔗 Возвращаем оригинальный URL: ${originalUrl}`);
+        return originalUrl;
+    }
     // 2. Метод для показа конкретного задания
     private async showTaskDetails(ctx: BotContext, taskId: number): Promise<void> {
         try {
@@ -938,9 +949,14 @@ class StarBot {
                 ]);
 
             } else if (task.type === 'referral_click' && task.targetUrl) {
-                // Генерируем уникальную ссылку
+                // ИСПРАВЛЕННЫЙ БЛОК: Используем оригинальную ссылку
+                const originalUrl = task.targetUrl;
+
+                // Генерируем уникальный ID для отслеживания
                 const clickId = this.generateClickId(user.id, task.id);
-                const trackingUrl = `${task.targetUrl}?ref=${clickId}&user=${user.telegramId}`;
+
+                console.log(`🔗 Используем оригинальный URL: ${originalUrl}`);
+                console.log(`🔗 Click ID для отслеживания: ${clickId}`);
 
                 // Создаем запись о начале выполнения
                 const userTask = userTaskRepository.create({
@@ -958,7 +974,7 @@ class StarBot {
                 keyboard.inline_keyboard.push([
                     {
                         text: `🔗 Перейти по ссылке (+${task.reward}⭐)`,
-                        url: trackingUrl
+                        url: originalUrl  // ← ИСПОЛЬЗУЕМ ОРИГИНАЛЬНУЮ ССЫЛКУ
                     }
                 ]);
             }
@@ -989,6 +1005,7 @@ class StarBot {
             await ctx.answerCbQuery('❌ Ошибка загрузки задания');
         }
     }
+
 
     // 3. Метод для проверки подписки на канал
     private async verifyChannelSubscription(ctx: BotContext, taskId: number): Promise<void> {
@@ -1166,6 +1183,48 @@ class StarBot {
 
         } catch (error) {
             console.error('❌ Error saving task click:', error);
+        }
+    }
+
+    private async createTaskViaAdmin(ctx: BotContext, type: string, title: string, description: string, reward: number, url?: string, channel?: string, bot?: string): Promise<void> {
+        try {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.reply('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskRepository = AppDataSource.getRepository(Task);
+
+            const task = taskRepository.create({
+                title,
+                description,
+                type: type as any,
+                reward,
+                targetUrl: url,
+                channelUsername: channel,
+                botUsername: bot,
+                status: 'active',
+                isAvailable: true,
+                maxCompletions: 1
+            });
+
+            await taskRepository.save(task);
+
+            await ctx.reply(
+                `✅ *Задание создано!*\n\n` +
+                `🎯 Название: ${title}\n` +
+                `💰 Награда: ${reward} ⭐\n` +
+                `📝 Тип: ${this.getTaskTypeName(type)}\n` +
+                `🔗 ${url ? `Ссылка: ${url}` : ''}\n` +
+                `📢 ${channel ? `Канал: ${channel}` : ''}\n` +
+                `🤖 ${bot ? `Бот: ${bot}` : ''}\n\n` +
+                `🆔 ID задания: ${task.id}`,
+                { parse_mode: 'Markdown' }
+            );
+
+        } catch (error) {
+            console.error('❌ Error creating task:', error);
+            await ctx.reply('❌ Ошибка при создании задания');
         }
     }
 
@@ -3130,6 +3189,14 @@ class StarBot {
                 `👥 Звёзды за друзей - Пригласить друзей\n` +
                 `💰 Вывод средств - Вывести заработанное\n` +
                 `❓ Помощь - Эта справка\n` +
+                `═══════════════════\n` +
+                `🎯 *Задания:*\n` +
+                `• 📢 Подписка на каналы - 10-20⭐\n` +
+                `• 🤖 Подписка на ботов - 10-15⭐\n` +
+                `• 🔗 Переход по ссылкам - 15-50⭐\n` +
+                `• ⏰ Время выполнения: 2 минуты\n` +
+                `• 💰 Награда начисляется автоматически\n` +
+                `═══════════════════\n` +
                 `═══════════════════\n` +
                 `🎲 *Игры и ставки:*\n` +
                 `• 🎲 Кости - 3⭐\n` +
@@ -6557,6 +6624,137 @@ class StarBot {
                 await ctx.editMessageText('❌ Ошибка при массовой деактивации заданий');
             }
         });
+        this.bot.command('create_task', async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.reply('⛔ У вас нет прав');
+                return;
+            }
+
+            const text = ctx.message.text;
+
+            if (!text.includes('"') || text.split('"').length < 5) {
+                await ctx.reply(
+                    '<b>📝 СОЗДАНИЕ ЗАДАНИЯ</b>\n\n' +
+                    '<b>Формат:</b>\n' +
+                    '<code>/create_task ref 25 "Название" "Описание" https://ссылка.com</code>\n\n' +
+                    '<b>Типы:</b>\n' +
+                    '• ref - реферальная ссылка\n' +
+                    '• channel - подписка на канал\n' +
+                    '• bot - подписка на бота\n\n' +
+                    '<b>Пример:</b>\n' +
+                    '<code>/create_task ref 25 "Посетите сайт" "Перейдите по ссылке" https://t.me/myballs/app?startapp=ref_npdo39sayc</code>',
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            try {
+                // Извлекаем тип
+                const parts = text.split(' ');
+                const type = parts[1].toLowerCase();
+                const reward = parseInt(parts[2]);
+
+                // Извлекаем название (между первыми кавычками)
+                const titleStart = text.indexOf('"');
+                const titleEnd = text.indexOf('"', titleStart + 1);
+                const title = text.substring(titleStart + 1, titleEnd);
+
+                // Извлекаем описание (между вторыми кавычками)
+                const descStart = text.indexOf('"', titleEnd + 1);
+                const descEnd = text.indexOf('"', descStart + 1);
+                const description = text.substring(descStart + 1, descEnd);
+
+                // Извлекаем ссылку/канал (после описания)
+                const urlOrChannel = text.substring(descEnd + 1).trim();
+
+                console.log('📊 Парсинг команды create_task:');
+                console.log('Type:', type);
+                console.log('Reward:', reward);
+                console.log('Title:', title);
+                console.log('Description:', description);
+                console.log('URL/Channel:', urlOrChannel);
+
+                if (isNaN(reward) || reward < 1) {
+                    await ctx.reply('❌ Награда должна быть положительным числом');
+                    return;
+                }
+
+                let taskType = '';
+                let targetUrl = '';
+                let channelUsername = '';
+                let botUsername = '';
+
+                switch (type) {
+                    case 'ref':
+                        taskType = 'referral_click';
+                        if (!urlOrChannel) {
+                            await ctx.reply('❌ Для реферального задания нужна ссылка');
+                            return;
+                        }
+                        targetUrl = urlOrChannel;
+                        break;
+
+                    case 'channel':
+                        taskType = 'channel_subscription';
+                        channelUsername = urlOrChannel.startsWith('@') ? urlOrChannel : `@${urlOrChannel}`;
+                        break;
+
+                    case 'bot':
+                        taskType = 'bot_subscription';
+                        botUsername = urlOrChannel.startsWith('@') ? urlOrChannel : `@${urlOrChannel}`;
+                        break;
+
+                    default:
+                        await ctx.reply('❌ Неизвестный тип задания. Используйте: ref, channel, bot');
+                        return;
+                }
+
+                const taskRepository = AppDataSource.getRepository(Task);
+
+                const task = taskRepository.create({
+                    title,
+                    description,
+                    type: taskType as any,
+                    reward,
+                    targetUrl,
+                    channelUsername,
+                    botUsername,
+                    status: 'active',
+                    isAvailable: true,
+                    maxCompletions: 1
+                });
+
+                await taskRepository.save(task);
+
+                // HTML сообщение
+                let message = '<b>✅ ЗАДАНИЕ СОЗДАНО!</b>\n\n';
+                message += `<b>🎯 Название:</b> ${this.escapeHtml(title)}\n`;
+                message += `<b>📝 Описание:</b> ${this.escapeHtml(description)}\n`;
+                message += `<b>💰 Награда:</b> ${reward} ⭐\n`;
+                message += `<b>📊 Тип:</b> ${this.getTaskTypeName(taskType)}\n`;
+
+                if (targetUrl) {
+                    message += `<b>🔗 Ссылка:</b> <code>${this.escapeHtml(targetUrl)}</code>\n`;
+                    message += `<b>⚠️ Важно:</b> Ссылка будет использована БЕЗ ИЗМЕНЕНИЙ\n`;
+                }
+                if (channelUsername) {
+                    message += `<b>📢 Канал:</b> ${channelUsername}\n`;
+                }
+                if (botUsername) {
+                    message += `<b>🤖 Бот:</b> ${botUsername}\n`;
+                }
+
+                message += `\n<b>🆔 ID задания:</b> ${task.id}\n`;
+                message += `<b>📅 Создано:</b> ${new Date().toLocaleString('ru-RU')}`;
+
+                await ctx.reply(message, { parse_mode: 'HTML' });
+
+            } catch (error) {
+                console.error('❌ Error creating task:', error);
+                await ctx.reply('❌ Ошибка при создании задания');
+            }
+        });
+
 
         this.bot.command('add_task', async (ctx) => {
             if (!this.isAdmin(ctx.from.id)) {
@@ -7255,7 +7453,14 @@ ${result.success ? '🎉 Все данные успешно синхронизи
             }
         });
     }
-
+    private escapeHtml(text: string): string {
+        if (!text) return '';
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
     private async updateTaskInfoMessage(ctx: BotContext, taskId: number): Promise<void> {
         try {
             // Получаем обновленную информацию о задании
@@ -7349,7 +7554,28 @@ ${result.success ? '🎉 Все данные успешно синхронизи
             console.error('❌ Error updating task info message:', error);
         }
     }
-
+    private escapeMarkdown(text: string): string {
+        if (!text) return '';
+        return text
+            .replace(/_/g, '\\_')
+            .replace(/\*/g, '\\*')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)')
+            .replace(/~/g, '\\~')
+            .replace(/`/g, '\\`')
+            .replace(/>/g, '\\>')
+            .replace(/#/g, '\\#')
+            .replace(/\+/g, '\\+')
+            .replace(/-/g, '\\-')
+            .replace(/=/g, '\\=')
+            .replace(/\|/g, '\\|')
+            .replace(/\{/g, '\\{')
+            .replace(/\}/g, '\\}')
+            .replace(/\./g, '\\.')
+            .replace(/!/g, '\\!');
+    }
     public launch() {
         // Обработчик ошибок Telegraf
         this.bot.catch((err: any, ctx: BotContext) => {
