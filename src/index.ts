@@ -8,13 +8,23 @@ import { Game } from './entities/Game';
 import axios from 'axios';
 import { GoogleSheetsService } from './services/google-sheets.service';
 import { Captcha } from './entities/Captcha';
+import { Task, TaskStatus } from './entities/Task';
+import { UserTask } from './entities/UserTask';
+import { LessThan, MoreThan } from 'typeorm';
+import { TaskClick } from './entities/TaskClick';
 
 dotenv.config();
 
-
+interface BotSession {
+    waitingForReward?: number;
+    rewardMessageId?: number;
+    rewardTimeout?: number;  // ← ДОБАВЬ ЭТО
+    // ... другие поля сессии
+}
 
 // Интерфейс для контекста
 interface BotContext extends Context {
+    session?: BotSession;
     user?: User;
     tempBroadcastMessage?: string;
     tempBroadcastMessageHTML?: string;
@@ -23,6 +33,7 @@ interface BotContext extends Context {
 
 class StarBot {
     private bot: Telegraf<BotContext>;
+    private userSessions: { [userId: number]: BotSession } = {}; // ← ДОБАВЬ ЭТО
     private captchaStore = new Map<number, {
         correctEmoji: string;
         options: string[];
@@ -43,6 +54,9 @@ class StarBot {
     private adminIds: number[]; // Массив для нескольких админов
     private sheetsUpdateTimeouts: Map<number, NodeJS.Timeout> = new Map();
     private readonly SHEETS_UPDATE_DELAY = 3000; // 3 секунды задержки
+    private readonly TASK_COMPLETION_DELAY = 2 * 60 * 1000; // 2 минуты для реферальных заданий
+    private taskVerificationQueue = new Map<string, NodeJS.Timeout>();
+    private activeTaskClicks = new Map<string, { userId: number, taskId: number, clickTime: Date }>();
     private async scheduleSheetsUpdate(user: User): Promise<void> {
         const userId = user.telegramId;
 
@@ -66,6 +80,29 @@ class StarBot {
         }, this.SHEETS_UPDATE_DELAY);
 
         this.sheetsUpdateTimeouts.set(userId, timeout);
+    }
+
+    private setupSessionCleanup() {
+        // Очищаем устаревшие сессии каждые 5 минут
+        setInterval(() => {
+            const now = Date.now();
+            const timeout = 5 * 60 * 1000; // 5 минут
+
+            // Используем глобальное хранилище сессий если есть, или пропускаем
+            if (!this.userSessions) {
+                return;
+            }
+
+            for (const userId in this.userSessions) {
+                const session = this.userSessions[parseInt(userId)];
+                if (session && session.rewardTimeout && (now - session.rewardTimeout) > timeout) {
+                    console.log(`🧹 Очищаю устаревшую сессию ввода награды для пользователя ${userId}`);
+                    delete session.waitingForReward;
+                    delete session.rewardMessageId;
+                    delete session.rewardTimeout;
+                }
+            }
+        }, 300000); // 5 минут
     }
 
     private async checkAndSetGameLock(ctx: BotContext): Promise<boolean> {
@@ -197,6 +234,12 @@ class StarBot {
         setInterval(() => this.cleanupOldLocks(), 60 * 1000);
         // Очистка при старте
         this.cleanupOldLocks();
+        // setInterval(() => this.checkPendingTasks(), 30 * 1000); // Каждые 30 секунд
+        // setInterval(() => this.checkExpiredClicks(), 60 * 1000); // Каждую минуту
+        // setInterval(() => this.cleanupExpiredTasks(), 5 * 60 * 1000); // Каждые 5 минут
+
+        // Запускаем сразу
+        // this.checkPendingTasks();
         // Инициализируем Google Sheets если есть ID
         if (process.env.GOOGLE_SHEET_ID) {
             this.googleSheets = new GoogleSheetsService();
@@ -224,7 +267,25 @@ class StarBot {
         this.setupAllHandlers();
 
         // Запускаем периодические проверки
+
         this.startPeriodicTasks();
+
+        this.setupTaskChecker();
+
+    }
+
+    private setupTaskChecker() {
+        // Проверяем pending задания каждые 30 секунд
+        setInterval(async () => {
+            try {
+                await this.checkPendingTasks();
+                await this.cleanupExpiredTasks();
+            } catch (error) {
+                console.error('❌ Error in task checker:', error);
+            }
+        }, 30000); // 30 секунд
+
+        console.log('✅ Task checker initialized (every 30 seconds)');
     }
     private cleanupOldLocks(): void {
         const now = Date.now();
@@ -240,6 +301,1289 @@ class StarBot {
 
         if (cleared > 0) {
             console.log(`🧹 Total cleared locks: ${cleared}`);
+        }
+    }
+
+    // 1. Метод для показа списка заданий
+    private async showTasksMenu(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+            console.log(`📋 Пользователь ${user.id} запросил следующее задание`);
+
+            // Получаем ВСЕ активные задания
+            const allTasks = await AppDataSource.getRepository(Task)
+                .createQueryBuilder('task')
+                .where('task.status = :status', { status: 'active' })
+                .andWhere('task.isAvailable = :available', { available: true })
+                .getMany();
+
+            if (allTasks.length === 0) {
+                await this.sendTaskMenu(ctx,
+                    '📋 *Задания*\n\n' +
+                    'На данный момент нет доступных заданий.\n' +
+                    'Задания появляются регулярно, следите за обновлениями!'
+                );
+                return;
+            }
+
+            // Получаем ВЫПОЛНЕННЫЕ задания пользователя
+            const completedTasks = await AppDataSource.getRepository(UserTask)
+                .createQueryBuilder('userTask')
+                .where('userTask.userId = :userId', { userId: user.id })
+                .andWhere('userTask.status = :status', { status: 'completed' })
+                .getMany();
+
+            // Получаем задания в процессе выполнения (ожидание)
+            const pendingTasks = await AppDataSource.getRepository(UserTask)
+                .createQueryBuilder('userTask')
+                .leftJoinAndSelect('userTask.task', 'task')
+                .where('userTask.userId = :userId', { userId: user.id })
+                .andWhere('userTask.status = :status', { status: 'pending' })
+                .getMany();
+
+            // Находим ID заданий, которые пользователь уже выполнил
+            const completedTaskIds = completedTasks.map(ut => ut.taskId);
+
+            // Находим задания, которые пользователь еще НЕ выполнял
+            let availableTasks = allTasks.filter(task =>
+                !completedTaskIds.includes(task.id)
+            );
+
+            // Если пользователь уже выполнил ВСЕ задания
+            if (availableTasks.length === 0) {
+                const totalReward = completedTasks.reduce((sum, ut) => {
+                    const task = allTasks.find(t => t.id === ut.taskId);
+                    return sum + (task?.reward || 0);
+                }, 0);
+
+                await this.sendTaskMenu(ctx,
+                    '🎉 *Поздравляем!*\n\n' +
+                    'Вы выполнили все доступные задания!\n\n' +
+                    '📋 *Выполнено заданий:* ' + completedTasks.length + '\n' +
+                    '💰 *Всего заработано:* ' + totalReward + ' ⭐\n\n' +
+                    '🔄 Новые задания появляются регулярно.\n' +
+                    'Возвращайтесь позже за новыми заданиями!'
+                );
+                return;
+            }
+
+            // Выбираем ОДНО случайное задание из доступных
+            const randomTask = availableTasks[Math.floor(Math.random() * availableTasks.length)];
+
+            // Проверяем, есть ли уже запись об этом задании у пользователя
+            const existingUserTask = await AppDataSource.getRepository(UserTask).findOne({
+                where: {
+                    userId: user.id,
+                    taskId: randomTask.id,
+                    status: 'pending'
+                }
+            });
+
+            let message = '';
+            let keyboard: any;
+
+            // Если задание уже в процессе выполнения (ожидание)
+            if (existingUserTask) {
+                message = `⏳ *Задание уже в процессе выполнения*\n\n`;
+                message += `🎯 *${randomTask.title}*\n`;
+                message += `📝 ${randomTask.description}\n\n`;
+
+                // Рассчитываем оставшееся время
+                const now = new Date();
+                const completionTime = existingUserTask.completionTime || new Date(now.getTime() + 2 * 60 * 1000);
+                const timeLeft = Math.max(0, Math.ceil((completionTime.getTime() - now.getTime()) / 60000));
+
+                message += `⏰ *Ожидание завершения:* ~${timeLeft} минут\n`;
+                message += `💰 Награда: ${randomTask.reward} ⭐\n\n`;
+                message += `💡 После завершения задания вы получите награду автоматически.`;
+
+                keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Проверить другие задания', callback_data: 'show_tasks' },
+                            { text: '📊 Моя статистика', callback_data: 'my_tasks' }
+                        ],
+                        [
+                            { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                        ]
+                    ]
+                };
+            } else {
+                // Новое задание для пользователя
+                // Создаем запись о начале выполнения задания
+                const userTaskRepo = AppDataSource.getRepository(UserTask);
+                const newUserTask = userTaskRepo.create({
+                    userId: user.id,
+                    taskId: randomTask.id,
+                    status: 'pending',
+                    clickTime: new Date(),
+                    completionTime: new Date(Date.now() + 2 * 60 * 1000) // +2 минуты для реферальных заданий
+                });
+                await userTaskRepo.save(newUserTask);
+
+                message = `🎯 *Новое задание для вас!*\n\n`;
+                message += `**${randomTask.title}**\n`;
+                message += `📝 ${randomTask.description}\n\n`;
+                message += `💰 *Награда:* ${randomTask.reward} ⭐\n`;
+                message += `⏰ *Время на выполнение:* 2 минуты\n\n`;
+
+                // Добавляем информацию в зависимости от типа задания
+                if (randomTask.type === 'channel_subscription' && randomTask.channelUsername) {
+                    message += `📢 *Как выполнить:*\n`;
+                    message += `1. Подпишитесь на канал ${randomTask.channelUsername}\n`;
+                    message += `2. Нажмите кнопку "Проверить подписку" ниже\n\n`;
+
+                    keyboard = {
+                        inline_keyboard: [
+                            [
+                                {
+                                    text: `📢 Подписаться на ${randomTask.channelUsername}`,
+                                    url: `https://t.me/${randomTask.channelUsername.replace('@', '')}`
+                                }
+                            ],
+                            [
+                                {
+                                    text: '✅ Проверить подписку',
+                                    callback_data: `verify_subscription_${randomTask.id}`
+                                }
+                            ],
+                            [
+                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '📊 Статистика', callback_data: 'my_tasks' }
+                            ],
+                            [
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
+                        ]
+                    };
+                } else if (randomTask.type === 'referral_click' && randomTask.targetUrl) {
+                    // Генерируем уникальную ссылку с ID клика
+                    const clickId = this.generateClickId(user.id, randomTask.id);
+                    const trackingUrl = `${randomTask.targetUrl}?ref=${clickId}&user=${user.telegramId}`;
+
+                    message += `🔗 *Как выполнить:*\n`;
+                    message += `1. Перейдите по специальной ссылке\n`;
+                    message += `2. Оставайтесь на сайте 2 минуты\n`;
+                    message += `3. Получите награду автоматически\n\n`;
+                    message += `⚠️ *Важно:* Не закрывайте сайт раньше времени!`;
+
+                    // Сохраняем информацию о клике
+                    await this.saveTaskClick(user.id, randomTask.id, clickId);
+
+                    keyboard = {
+                        inline_keyboard: [
+                            [
+                                {
+                                    text: `🔗 Перейти по ссылке (+${randomTask.reward}⭐)`,
+                                    url: trackingUrl
+                                }
+                            ],
+                            [
+                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '📊 Статистика', callback_data: 'my_tasks' }
+                            ],
+                            [
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
+                        ]
+                    };
+                } else if (randomTask.type === 'bot_subscription' && randomTask.botUsername) {
+                    message += `🤖 *Как выполнить:*\n`;
+                    message += `1. Подпишитесь на бота ${randomTask.botUsername}\n`;
+                    message += `2. Нажмите кнопку "Проверить подписку" ниже\n\n`;
+
+                    keyboard = {
+                        inline_keyboard: [
+                            [
+                                {
+                                    text: `🤖 Перейти к боту`,
+                                    url: `https://t.me/${randomTask.botUsername.replace('@', '')}`
+                                }
+                            ],
+                            [
+                                {
+                                    text: '✅ Проверить подписку',
+                                    callback_data: `verify_bot_subscription_${randomTask.id}`
+                                }
+                            ],
+                            [
+                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '📊 Статистика', callback_data: 'my_tasks' }
+                            ],
+                            [
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
+                        ]
+                    };
+                } else {
+                    // Общий случай
+                    keyboard = {
+                        inline_keyboard: [
+                            [
+                                { text: '🎯 Выполнить задание', callback_data: `show_task_${randomTask.id}` }
+                            ],
+                            [
+                                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                                { text: '📊 Статистика', callback_data: 'my_tasks' }
+                            ],
+                            [
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
+                        ]
+                    };
+                }
+            }
+
+            // Добавляем информацию о доступных заданиях
+            message += `\n──────────────\n`;
+            message += `📊 *Доступно заданий:* ${availableTasks.length}\n`;
+            message += `✅ *Выполнено:* ${completedTasks.length}\n`;
+
+            if (pendingTasks.length > 0) {
+                message += `⏳ *В процессе:* ${pendingTasks.length}\n`;
+            }
+
+            if (ctx.callbackQuery) {
+                try {
+                    await ctx.editMessageText(message, {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                    await ctx.answerCbQuery('🎯 Новое задание готово!');
+                } catch (editError: any) {
+                    if (!editError.response?.description?.includes('message is not modified')) {
+                        throw editError;
+                    }
+                }
+            } else {
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Error showing single task:', error);
+
+            await ctx.reply(
+                '❌ *Ошибка при загрузке задания*\n\n' +
+                'Попробуйте еще раз через несколько секунд.',
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '🔄 Попробовать снова', callback_data: 'show_tasks' },
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]
+                        ]
+                    }
+                }
+            );
+        }
+    }
+
+    private async getNextTaskForUser(userId: number): Promise<Task | null> {
+        try {
+            // Получаем все активные задания
+            const allTasks = await AppDataSource.getRepository(Task)
+                .createQueryBuilder('task')
+                .where('task.status = :status', { status: 'active' })
+                .andWhere('task.isAvailable = :available', { available: true })
+                .getMany();
+
+            if (allTasks.length === 0) return null;
+
+            // Получаем выполненные задания пользователя
+            const completedTasks = await AppDataSource.getRepository(UserTask)
+                .createQueryBuilder('userTask')
+                .where('userTask.userId = :userId', { userId: userId })
+                .andWhere('userTask.status = :status', { status: 'completed' })
+                .getMany();
+
+            // Получаем задания в процессе выполнения
+            const pendingTasks = await AppDataSource.getRepository(UserTask)
+                .createQueryBuilder('userTask')
+                .where('userTask.userId = :userId', { userId: userId })
+                .andWhere('userTask.status = :status', { status: 'pending' })
+                .getMany();
+
+            // Находим задания, которые пользователь еще не начинал
+            const completedAndPendingIds = [
+                ...completedTasks.map(ut => ut.taskId),
+                ...pendingTasks.map((ut: UserTask) => ut.taskId) // Добавляем тип
+            ];
+
+            const availableTasks = allTasks.filter(task =>
+                !completedAndPendingIds.includes(task.id)
+            );
+
+            if (availableTasks.length === 0) return null;
+
+            // Выбираем случайное задание
+            const randomIndex = Math.floor(Math.random() * availableTasks.length);
+            return availableTasks[randomIndex];
+        } catch (error) {
+            console.error('❌ Error getting next task:', error);
+            return null;
+        }
+    }
+    private async sendTaskMenu(ctx: BotContext, message: string): Promise<void> {
+        try {
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🔄 Обновить', callback_data: 'refresh_tasks' },
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]
+                ]
+            };
+
+            if (ctx.callbackQuery) {
+                await ctx.editMessageText(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            } else {
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+        } catch (error) {
+            console.error('❌ Error in sendTaskMenu:', error);
+            await ctx.reply('❌ Ошибка отображения меню заданий.');
+        }
+    }
+
+    // 2. Метод для показа конкретного задания
+    private async showTaskDetails(ctx: BotContext, taskId: number): Promise<void> {
+        try {
+            const user = ctx.user!;
+            await ctx.answerCbQuery('🎯 Загружаю задание...');
+
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+
+            if (!task || !task.isAvailable || task.status !== 'active') {
+                await ctx.answerCbQuery('❌ Задание недоступно');
+
+                // Предлагаем другое задание
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Получить другое задание', callback_data: 'show_tasks' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(
+                    '❌ Это задание больше недоступно.\n' +
+                    'Получите новое задание!',
+                    { reply_markup: keyboard }
+                );
+                return;
+            }
+
+            // Проверяем статус задания у пользователя
+            const userTasks = await userTaskRepository.find({
+                where: {
+                    userId: user.id,
+                    taskId: task.id
+                }
+            });
+
+            const completedCount = userTasks.filter(ut => ut.status === 'completed').length;
+            const pendingTask = userTasks.find(ut => ut.status === 'pending');
+
+            if (completedCount >= task.maxCompletions) {
+                await ctx.answerCbQuery('✅ Вы уже выполнили это задание');
+
+                // Предлагаем другое задание
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Получить новое задание', callback_data: 'show_tasks' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(
+                    '🎉 Вы уже выполнили это задание!\n' +
+                    '💰 Получено: ' + (task.reward * completedCount) + ' ⭐\n\n' +
+                    'Получите следующее задание!',
+                    { parse_mode: 'Markdown', reply_markup: keyboard }
+                );
+                return;
+            }
+
+            // Если задание уже в процессе выполнения
+            if (pendingTask) {
+                let message = `⏳ *Задание в процессе выполнения*\n\n`;
+                message += `🎯 **${task.title}**\n`;
+                message += `📝 ${task.description}\n\n`;
+
+                // Рассчитываем оставшееся время
+                const now = new Date();
+                const completionTime = pendingTask.completionTime || new Date(now.getTime() + 2 * 60 * 1000);
+                const timeLeft = Math.max(0, Math.ceil((completionTime.getTime() - now.getTime()) / 60000));
+
+                message += `⏰ *Осталось:* ~${timeLeft} минут\n`;
+                message += `💰 *Награда:* ${task.reward} ⭐\n\n`;
+                message += `💡 Ожидайте завершения задания.`;
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Другое задание', callback_data: 'show_tasks' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+                return;
+            }
+
+            // Если задание новое для пользователя, показываем детали
+            let message = `🎯 **${task.title}**\n\n`;
+            message += `📝 ${task.description}\n\n`;
+            message += `💰 *Награда:* ${task.reward} ⭐\n`;
+            message += `🎯 *Тип:* ${this.getTaskTypeName(task.type)}\n`;
+
+            if (task.maxCompletions > 1) {
+                message += `📊 *Можно выполнить:* ${task.maxCompletions} раз(а)\n`;
+                message += `✅ *Выполнено вами:* ${completedCount}/${task.maxCompletions}\n`;
+            }
+
+            message += `\n──────────────\n`;
+            message += `📊 *Следующее задание:*\n`;
+            message += `• После выполнения этого задания\n`;
+            message += `• Получите новое задание\n`;
+            message += `• Доступно по одному за раз\n`;
+
+            const keyboard = {
+                inline_keyboard: [] as any[]
+            };
+
+            // Добавляем кнопки в зависимости от типа задания
+            if (task.type === 'channel_subscription' && task.channelUsername) {
+                keyboard.inline_keyboard.push([
+                    {
+                        text: `📢 Подписаться на ${task.channelUsername}`,
+                        url: `https://t.me/${task.channelUsername.replace('@', '')}`
+                    }
+                ]);
+
+                keyboard.inline_keyboard.push([
+                    {
+                        text: '✅ Проверить подписку',
+                        callback_data: `verify_subscription_${task.id}`
+                    }
+                ]);
+
+            } else if (task.type === 'bot_subscription' && task.botUsername) {
+                keyboard.inline_keyboard.push([
+                    {
+                        text: `🤖 Перейти к боту`,
+                        url: `https://t.me/${task.botUsername.replace('@', '')}`
+                    }
+                ]);
+
+                keyboard.inline_keyboard.push([
+                    {
+                        text: '✅ Проверить подписку',
+                        callback_data: `verify_bot_subscription_${task.id}`
+                    }
+                ]);
+
+            } else if (task.type === 'referral_click' && task.targetUrl) {
+                // Генерируем уникальную ссылку
+                const clickId = this.generateClickId(user.id, task.id);
+                const trackingUrl = `${task.targetUrl}?ref=${clickId}&user=${user.telegramId}`;
+
+                // Создаем запись о начале выполнения
+                const userTask = userTaskRepository.create({
+                    userId: user.id,
+                    taskId: task.id,
+                    status: 'pending',
+                    clickTime: new Date(),
+                    completionTime: new Date(Date.now() + 2 * 60 * 1000)
+                });
+                await userTaskRepository.save(userTask);
+
+                // Сохраняем информацию о клике
+                await this.saveTaskClick(user.id, task.id, clickId);
+
+                keyboard.inline_keyboard.push([
+                    {
+                        text: `🔗 Перейти по ссылке (+${task.reward}⭐)`,
+                        url: trackingUrl
+                    }
+                ]);
+            }
+
+            keyboard.inline_keyboard.push([
+                { text: '🔄 Другое задание', callback_data: 'show_tasks' },
+                { text: '📊 Мои задания', callback_data: 'my_tasks' }
+            ]);
+
+            keyboard.inline_keyboard.push([
+                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+            ]);
+
+            if (ctx.callbackQuery) {
+                await ctx.editMessageText(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            } else {
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Error showing task details:', error);
+            await ctx.answerCbQuery('❌ Ошибка загрузки задания');
+        }
+    }
+
+    // 3. Метод для проверки подписки на канал
+    private async verifyChannelSubscription(ctx: BotContext, taskId: number): Promise<void> {
+        try {
+            const user = ctx.user!;
+            await ctx.answerCbQuery('🔍 Проверяем подписку...');
+
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+
+            if (!task || task.type !== 'channel_subscription' || !task.channelUsername) {
+                await ctx.answerCbQuery('❌ Ошибка задания');
+                return;
+            }
+
+            // Проверяем, не выполнял ли уже пользователь это задание
+            const existingTask = await userTaskRepository.findOne({
+                where: {
+                    userId: user.id,
+                    taskId: task.id,
+                    status: 'completed'
+                }
+            });
+
+            if (existingTask) {
+                await ctx.answerCbQuery('✅ Вы уже выполнили это задание');
+
+                // Предлагаем следующее задание
+                const nextTask = await this.getNextTaskForUser(user.id);
+                if (nextTask) {
+                    const keyboard = {
+                        inline_keyboard: [
+                            [{ text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }]
+                        ]
+                    };
+                    await ctx.reply('✅ Вы уже выполнили это задание! Перейдите к следующему.', {
+                        reply_markup: keyboard
+                    });
+                }
+                return;
+            }
+
+            // Проверяем подписку
+            const channelUsername = task.channelUsername.startsWith('@')
+                ? task.channelUsername
+                : `@${task.channelUsername}`;
+
+            let isSubscribed = false;
+
+            try {
+                const chatMember = await ctx.telegram.getChatMember(channelUsername, user.telegramId);
+                isSubscribed = chatMember.status !== 'left' && chatMember.status !== 'kicked';
+            } catch (error) {
+                console.error('❌ Error checking subscription:', error);
+                await ctx.answerCbQuery('❌ Ошибка проверки подписки');
+                return;
+            }
+
+            if (isSubscribed) {
+                // Создаем запись о выполнении задания
+                const userTask = userTaskRepository.create({
+                    userId: user.id,
+                    taskId: task.id,
+                    status: 'completed',
+                    completedAt: new Date(),
+                    verificationData: {
+                        subscribed: true,
+                        checkedAt: new Date(),
+                        chatId: channelUsername
+                    }
+                });
+
+                await userTaskRepository.save(userTask);
+
+                // Начисляем награду
+                user.stars += task.reward;
+                user.totalEarned += task.reward;
+                await AppDataSource.getRepository(User).save(user);
+
+                // Обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы:', sheetError);
+                    }
+                }
+
+                // Обновляем счетчик выполнений задания
+                task.totalCompletions += 1;
+                await taskRepository.save(task);
+
+                await ctx.answerCbQuery(`✅ Выполнено! +${task.reward}⭐`);
+
+                // Находим следующее задание
+                const nextTask = await this.getNextTaskForUser(user.id);
+
+                let message = `🎉 *Задание выполнено!*\n\n` +
+                    `✅ Вы успешно подписались на канал\n` +
+                    `💰 Получено: ${task.reward} ⭐\n` +
+                    `📊 Ваш баланс: ${user.stars} ⭐\n\n`;
+
+                let keyboard = {
+                    inline_keyboard: [] as any[]
+                };
+
+                if (nextTask) {
+                    message += `🎯 *Доступно следующее задание!*`;
+                    keyboard.inline_keyboard.push([
+                        { text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }
+                    ]);
+                    keyboard.inline_keyboard.push([
+                        { text: '📊 Моя статистика', callback_data: 'my_tasks' },
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]);
+                } else {
+                    message += `🎉 *Вы выполнили все доступные задания!*\n` +
+                        `🔄 Новые задания появятся позже.`;
+                    keyboard.inline_keyboard.push([
+                        { text: '📊 Моя статистика', callback_data: 'my_tasks' }
+                    ]);
+                    keyboard.inline_keyboard.push([
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]);
+                }
+
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+
+            } else {
+                await ctx.answerCbQuery('❌ Вы не подписаны на канал');
+
+                const message = `❌ *Подписка не найдена*\n\n` +
+                    `Для выполнения задания необходимо подписаться на канал:\n` +
+                    `${channelUsername}\n\n` +
+                    `После подписки нажмите "Проверить подписку" снова.`;
+
+                await ctx.reply(message, { parse_mode: 'Markdown' });
+            }
+
+        } catch (error) {
+            console.error('❌ Error verifying subscription:', error);
+            await ctx.answerCbQuery('❌ Ошибка проверки');
+        }
+    }
+
+    // 4. Метод для сохранения информации о клике (реферальные задания)
+    private async saveTaskClick(userId: number, taskId: number, clickId: string): Promise<void> {
+        try {
+            const taskClickRepository = AppDataSource.getRepository(TaskClick);
+
+            const click = taskClickRepository.create({
+                userId,
+                taskId,
+                clickId,
+                clickTime: new Date(),
+                expiresAt: new Date(Date.now() + this.TASK_COMPLETION_DELAY),
+                status: 'pending'
+            });
+
+            await taskClickRepository.save(click);
+
+            // Добавляем в активные клики
+            this.activeTaskClicks.set(clickId, {
+                userId,
+                taskId,
+                clickTime: new Date()
+            });
+
+            console.log(`🔗 Сохранен клик ${clickId} для задания ${taskId}, пользователь ${userId}`);
+
+        } catch (error) {
+            console.error('❌ Error saving task click:', error);
+        }
+    }
+
+    // 5. Метод для проверки завершения реферальных заданий
+    private async checkPendingTasks(): Promise<void> {
+        try {
+            console.log('🔍 Проверяю pending задания...');
+
+            const taskClickRepository = AppDataSource.getRepository(TaskClick);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userRepository = AppDataSource.getRepository(User);
+
+            // Находим клики, которые должны быть завершены (прошло более 2 минут)
+            const pendingClicks = await taskClickRepository.find({
+                where: {
+                    status: 'pending',
+                    expiresAt: LessThan(new Date()) // Время истекло
+                },
+                relations: ['task', 'user']
+            });
+
+            console.log(`📊 Найдено кликов для обработки: ${pendingClicks.length}`);
+
+            for (const click of pendingClicks) {
+                try {
+                    console.log(`🔍 Обработка клика ${click.clickId} для задания ${click.taskId}, пользователь ${click.userId}`);
+
+                    // Проверяем, не выполнил ли уже пользователь это задание
+                    const existingCompletion = await userTaskRepository.findOne({
+                        where: {
+                            userId: click.userId,
+                            taskId: click.taskId,
+                            status: 'completed'
+                        }
+                    });
+
+                    if (existingCompletion) {
+                        console.log(`⚠️ Пользователь ${click.userId} уже выполнил задание ${click.taskId}, пропускаем`);
+                        click.status = 'completed';
+                        await taskClickRepository.save(click);
+                        continue;
+                    }
+
+                    // Создаем запись о выполнении задания
+                    const userTask = userTaskRepository.create({
+                        userId: click.userId,
+                        taskId: click.taskId,
+                        status: 'completed',
+                        completedAt: new Date(),
+                        clickTime: click.clickTime,
+                        completionTime: new Date(),
+                        referralClickId: click.clickId
+                    });
+
+                    await userTaskRepository.save(userTask);
+                    console.log(`✅ Создана запись UserTask для клика ${click.clickId}`);
+
+                    // Начисляем награду
+                    const user = await userRepository.findOne({ where: { id: click.userId } });
+                    if (user) {
+                        const oldStars = user.stars;
+                        user.stars += click.task.reward;
+                        user.totalEarned += click.task.reward;
+                        await userRepository.save(user);
+
+                        console.log(`💰 Начислено ${click.task.reward}⭐ пользователю ${user.telegramId}. Было: ${oldStars}, стало: ${user.stars}`);
+
+                        // Обновляем Google Sheets
+                        if (this.googleSheets) {
+                            try {
+                                await this.scheduleSheetsUpdate(user);
+                            } catch (sheetError) {
+                                console.error('❌ Ошибка обновления таблицы:', sheetError);
+                            }
+                        }
+
+                        // Ищем следующее задание для пользователя
+                        const nextTask = await this.getNextTaskForUser(user.id);
+
+                        // Формируем сообщение с кнопкой
+                        let message = `🎉 *Задание выполнено!*\n\n` +
+                            `✅ Вы успешно выполнили задание: "${click.task.title}"\n` +
+                            `💰 Получено: ${click.task.reward} ⭐\n` +
+                            `📊 Ваш баланс: ${user.stars} ⭐\n\n`;
+
+                        let keyboard = {
+                            inline_keyboard: [] as any[]
+                        };
+
+                        if (nextTask) {
+                            message += `🎯 *Доступно следующее задание!*`;
+                            keyboard.inline_keyboard.push([
+                                { text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }
+                            ]);
+                            keyboard.inline_keyboard.push([
+                                { text: '📊 Моя статистика', callback_data: 'my_tasks' },
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]);
+                        } else {
+                            message += `🎉 *Вы выполнили все доступные задания!*\n` +
+                                `🔄 Новые задания появятся позже.`;
+                            keyboard.inline_keyboard.push([
+                                { text: '📊 Моя статистика', callback_data: 'my_tasks' }
+                            ]);
+                            keyboard.inline_keyboard.push([
+                                { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                            ]);
+                        }
+
+                        // Отправляем уведомление пользователю
+                        try {
+                            await this.bot.telegram.sendMessage(
+                                user.telegramId,
+                                message,
+                                {
+                                    parse_mode: 'Markdown',
+                                    reply_markup: keyboard
+                                }
+                            );
+                            console.log(`📨 Отправлено уведомление пользователю ${user.telegramId}`);
+                        } catch (notificationError: any) {
+                            console.error(`❌ Ошибка отправки уведомления пользователю ${user.telegramId}:`, notificationError.message);
+                        }
+                    } else {
+                        console.error(`❌ Пользователь ${click.userId} не найден`);
+                    }
+
+                    // Обновляем счетчик заданий
+                    click.task.totalCompletions += 1;
+                    await taskRepository.save(click.task);
+                    console.log(`📊 Обновлен счетчик заданий ${click.taskId}: ${click.task.totalCompletions} выполнений`);
+
+                    // Помечаем клик как завершенный
+                    click.status = 'completed';
+                    click.completionTime = new Date();
+                    await taskClickRepository.save(click);
+                    console.log(`✅ Клик ${click.clickId} помечен как completed`);
+
+                    // Удаляем из активных кликов
+                    this.activeTaskClicks.delete(click.clickId);
+                    console.log(`🗑️ Клик ${click.clickId} удален из активных кликов`);
+
+                    console.log(`✅ Задание ${click.taskId} завершено для пользователя ${click.userId}`);
+
+                } catch (taskError) {
+                    console.error(`❌ Ошибка обработки клика ${click.id}:`, taskError);
+                    // Помечаем как истекший в случае ошибки
+                    try {
+                        click.status = 'expired';
+                        await taskClickRepository.save(click);
+                    } catch (e) {
+                        console.error(`❌ Не удалось сохранить статус expired для клика ${click.id}`);
+                    }
+                }
+            }
+
+            if (pendingClicks.length > 0) {
+                console.log(`✅ Обработано ${pendingClicks.length} pending кликов`);
+            }
+
+        } catch (error) {
+            console.error('❌ Error checking pending tasks:', error);
+        }
+    }
+
+    // 6. Метод для проверки подписки на бота
+    private async verifyBotSubscription(ctx: BotContext, taskId: number): Promise<void> {
+        try {
+            const user = ctx.user!;
+            await ctx.answerCbQuery('🤖 Проверяем подписку на бота...');
+
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+
+            if (!task || task.type !== 'bot_subscription' || !task.botUsername) {
+                await ctx.answerCbQuery('❌ Ошибка задания');
+                return;
+            }
+
+            // Проверяем, не выполнял ли уже пользователь это задание
+            const existingTask = await userTaskRepository.findOne({
+                where: {
+                    userId: user.id,
+                    taskId: task.id,
+                    status: 'completed'
+                }
+            });
+
+            if (existingTask) {
+                await ctx.answerCbQuery('✅ Вы уже выполнили это задание');
+
+                // Предлагаем следующее задание
+                const nextTask = await this.getNextTaskForUser(user.id);
+                if (nextTask) {
+                    const keyboard = {
+                        inline_keyboard: [
+                            [{ text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }]
+                        ]
+                    };
+                    await ctx.reply('✅ Вы уже выполнили это задание! Перейдите к следующему.', {
+                        reply_markup: keyboard
+                    });
+                }
+                return;
+            }
+
+            const botUsername = task.botUsername.startsWith('@')
+                ? task.botUsername
+                : `@${task.botUsername}`;
+
+            // Для проверки подписки на бота используем метод getChat
+            try {
+                // Пытаемся получить информацию о чате с ботом
+                await ctx.telegram.getChat(botUsername);
+
+                // Если успешно, создаем запись о выполнении задания
+                const userTask = userTaskRepository.create({
+                    userId: user.id,
+                    taskId: task.id,
+                    status: 'completed',
+                    completedAt: new Date(),
+                    verificationData: {
+                        subscribed: true,
+                        checkedAt: new Date(),
+                        chatId: botUsername
+                    }
+                });
+
+                await userTaskRepository.save(userTask);
+
+                // Начисляем награду
+                user.stars += task.reward;
+                user.totalEarned += task.reward;
+                await AppDataSource.getRepository(User).save(user);
+
+                // Обновляем Google Sheets
+                if (this.googleSheets) {
+                    try {
+                        await this.scheduleSheetsUpdate(user);
+                    } catch (sheetError) {
+                        console.error('❌ Ошибка обновления таблицы:', sheetError);
+                    }
+                }
+
+                // Обновляем счетчик выполнений задания
+                task.totalCompletions += 1;
+                await taskRepository.save(task);
+
+                await ctx.answerCbQuery(`✅ Выполнено! +${task.reward}⭐`);
+
+                // Находим следующее задание
+                const nextTask = await this.getNextTaskForUser(user.id);
+
+                let message = `🎉 *Задание выполнено!*\n\n` +
+                    `✅ Вы успешно подписались на бота\n` +
+                    `💰 Получено: ${task.reward} ⭐\n` +
+                    `📊 Ваш баланс: ${user.stars} ⭐\n\n`;
+
+                let keyboard = {
+                    inline_keyboard: [] as any[]
+                };
+
+                if (nextTask) {
+                    message += `🎯 *Доступно следующее задание!*`;
+                    keyboard.inline_keyboard.push([
+                        { text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }
+                    ]);
+                    keyboard.inline_keyboard.push([
+                        { text: '📊 Моя статистика', callback_data: 'my_tasks' },
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]);
+                } else {
+                    message += `🎉 *Вы выполнили все доступные задания!*\n` +
+                        `🔄 Новые задания появятся позже.`;
+                    keyboard.inline_keyboard.push([
+                        { text: '📊 Моя статистика', callback_data: 'my_tasks' }
+                    ]);
+                    keyboard.inline_keyboard.push([
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]);
+                }
+
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+
+            } catch (error: any) {
+                console.error('❌ Error checking bot subscription:', error);
+
+                if (error.code === 400 && error.description.includes('chat not found')) {
+                    await ctx.answerCbQuery('❌ Вы не подписаны на бота');
+
+                    const message = `❌ *Подписка не найдена*\n\n` +
+                        `Для выполнения задания необходимо начать диалог с ботом:\n` +
+                        `${botUsername}\n\n` +
+                        `1. Нажмите на ссылку выше\n` +
+                        `2. Нажмите "START" в диалоге с ботом\n` +
+                        `3. Вернитесь и нажмите "Проверить подписку" снова`;
+
+                    await ctx.reply(message, { parse_mode: 'Markdown' });
+                } else {
+                    await ctx.answerCbQuery('❌ Ошибка проверки');
+                }
+            }
+
+        } catch (error) {
+            console.error('❌ Error verifying bot subscription:', error);
+            await ctx.answerCbQuery('❌ Ошибка проверки');
+        }
+    }
+    private async showRandomTaskNotification(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+
+            // Проверяем, есть ли новые задания
+            const allTasks = await AppDataSource.getRepository(Task)
+                .find({ where: { status: 'active', isAvailable: true } });
+
+            if (allTasks.length === 0) return;
+
+            const completedTasks = await AppDataSource.getRepository(UserTask)
+                .find({ where: { userId: user.id, status: 'completed' } });
+
+            const completedTaskIds = completedTasks.map(ut => ut.taskId);
+            const availableTasks = allTasks.filter(task =>
+                !completedTaskIds.includes(task.id)
+            );
+
+            if (availableTasks.length === 0) return;
+
+            // Отправляем периодическое напоминание
+            const randomTask = availableTasks[Math.floor(Math.random() * availableTasks.length)];
+
+            await ctx.reply(
+                `🎯 *Напоминание о заданиях!*\n\n` +
+                `У вас есть ${availableTasks.length} доступных заданий\n` +
+                `Например: "${randomTask.title}" за ${randomTask.reward} ⭐\n\n` +
+                `💡 Проверьте задания сейчас!`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '📋 Посмотреть задания', callback_data: 'show_tasks' }]
+                        ]
+                    }
+                }
+            );
+        } catch (error) {
+            console.error('❌ Error in random task notification:', error);
+        }
+    }
+
+    private async getNextAvailableTask(userId: number): Promise<Task | null> {
+        try {
+            const allTasks = await AppDataSource.getRepository(Task)
+                .find({ where: { status: 'active', isAvailable: true } });
+
+            const completedTasks = await AppDataSource.getRepository(UserTask)
+                .find({ where: { userId, status: 'completed' } });
+
+            const completedTaskIds = completedTasks.map(ut => ut.taskId);
+            const availableTasks = allTasks.filter(task =>
+                !completedTaskIds.includes(task.id)
+            );
+
+            if (availableTasks.length === 0) return null;
+
+            // Возвращаем случайное задание
+            return availableTasks[Math.floor(Math.random() * availableTasks.length)];
+        } catch (error) {
+            console.error('❌ Error getting next task:', error);
+            return null;
+        }
+    }
+    // 7. Метод для показа выполненных заданий пользователя
+    private async showUserTasks(ctx: BotContext): Promise<void> {
+        try {
+            const user = ctx.user!;
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+            const taskRepository = AppDataSource.getRepository(Task);
+
+            // Получаем выполненные задания
+            const completedTasks = await userTaskRepository.find({
+                where: {
+                    userId: user.id,
+                    status: 'completed'
+                },
+                relations: ['task'],
+                order: { completedAt: 'DESC' },
+                take: 10
+            });
+
+            // Получаем ВСЕ активные задания
+            const allTasks = await taskRepository.find({
+                where: {
+                    status: 'active',
+                    isAvailable: true
+                }
+            });
+
+            // Находим невыполненные задания
+            const completedTaskIds = completedTasks.map(ut => ut.taskId);
+            const availableTasks = allTasks.filter(task =>
+                !completedTaskIds.includes(task.id)
+            );
+
+            const totalReward = completedTasks.reduce((sum, ut) => sum + (ut.task?.reward || 0), 0);
+
+            let message = `📋 *Моя статистика заданий*\n\n`;
+
+            message += `📊 *Общая статистика:*\n`;
+            message += `• Всего заданий в системе: ${allTasks.length}\n`;
+            message += `• Доступно вам: ${availableTasks.length}\n`;
+            message += `• Выполнено: ${completedTasks.length}\n`;
+            message += `• Заработано: ${totalReward} ⭐\n\n`;
+
+            if (availableTasks.length > 0) {
+                message += `🎯 *Доступно заданий:* ${availableTasks.length}\n`;
+                message += `💡 Каждый раз при открытии списка вы видите 3 случайных задания\n\n`;
+
+                // Показываем примеры доступных наград
+                const sampleRewards = availableTasks
+                    .sort(() => Math.random() - 0.5)
+                    .slice(0, 3)
+                    .map(task => `${task.reward}⭐`)
+                    .join(', ');
+
+                message += `💰 *Примеры наград:* ${sampleRewards}\n\n`;
+            } else {
+                message += `🎉 *Поздравляем!*\n`;
+                message += `Вы выполнили все доступные задания!\n\n`;
+                message += `🔄 Новые задания появляются регулярно.\n`;
+                message += `Возвращайтесь позже! 😊\n\n`;
+            }
+
+            if (completedTasks.length > 0) {
+                message += `✅ *Последние выполненные задания:*\n`;
+                completedTasks.slice(0, 5).forEach((ut, index) => {
+                    const task = ut.task;
+                    if (task) {
+                        const date = ut.completedAt?.toLocaleDateString('ru-RU') || '';
+                        message += `${index + 1}. ${task.title}\n`;
+                        message += `   📅 ${date} | 💰 +${task.reward} ⭐\n\n`;
+                    }
+                });
+            }
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🎲 Новые задания', callback_data: 'show_tasks' },
+                        { text: '🔄 Обновить', callback_data: 'refresh_my_tasks' }
+                    ],
+                    [
+                        { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                    ]
+                ]
+            };
+
+            if (ctx.callbackQuery) {
+                await ctx.editMessageText(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            } else {
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Error showing user tasks:', error);
+            await ctx.reply('❌ Ошибка при загрузке статистики.');
+        }
+    }
+
+    // 8. Вспомогательные методы
+    private getTaskTypeName(type: string): string {
+        const names: Record<string, string> = {
+            'channel_subscription': '📢 Подписка на канал',
+            'bot_subscription': '🤖 Подписка на бота',
+            'referral_click': '🔗 Переход по ссылке'
+        };
+        return names[type] || type;
+    }
+
+    private generateClickId(userId: number, taskId: number): string {
+        return `click_${userId}_${taskId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    private async cleanupExpiredTasks(): Promise<void> {
+        try {
+            const taskClickRepository = AppDataSource.getRepository(TaskClick);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+            // Находим истекшие клики, которые не были обработаны
+            const expiredClicks = await taskClickRepository.find({
+                where: {
+                    status: 'pending',
+                    expiresAt: LessThan(new Date(Date.now() - 24 * 60 * 60 * 1000)) // Старые (>24 часов)
+                }
+            });
+
+            for (const click of expiredClicks) {
+                // Помечаем как истекшие
+                click.status = 'expired';
+                await taskClickRepository.save(click);
+
+                // Также помечаем связанные user_tasks как истекшие
+                const userTask = await userTaskRepository.findOne({
+                    where: {
+                        userId: click.userId,
+                        taskId: click.taskId,
+                        status: 'pending',
+                        referralClickId: click.clickId
+                    }
+                });
+
+                if (userTask) {
+                    userTask.status = 'expired';
+                    userTask.expiredAt = new Date();
+                    await userTaskRepository.save(userTask);
+                }
+            }
+
+            if (expiredClicks.length > 0) {
+                console.log(`🧹 Очищено ${expiredClicks.length} истекших кликов`);
+            }
+
+        } catch (error) {
+            console.error('❌ Error cleaning up expired tasks:', error);
+        }
+    }
+
+    private async checkExpiredClicks(): Promise<void> {
+        try {
+            const now = new Date();
+
+            for (const [clickId, data] of this.activeTaskClicks.entries()) {
+                const timePassed = now.getTime() - data.clickTime.getTime();
+
+                if (timePassed > this.TASK_COMPLETION_DELAY + 60000) { // +1 минута таймаута
+                    this.activeTaskClicks.delete(clickId);
+                    console.log(`🗑️ Удален просроченный клик ${clickId}`);
+                }
+            }
+
+        } catch (error) {
+            console.error('❌ Error checking expired clicks:', error);
         }
     }
     private async checkBalanceBeforeGame(ctx: BotContext, betAmount: number): Promise<boolean> {
@@ -672,6 +2016,33 @@ class StarBot {
         this.bot.command('my_withdrawals', async (ctx) => {
             await this.showUserWithdrawals(ctx);
         });
+
+        this.bot.command('check_tasks', async (ctx) => {
+            try {
+                const tasks = await AppDataSource.getRepository(Task).find();
+
+                let message = `📊 *Отладка заданий:*\n\n`;
+                message += `Всего заданий в базе: ${tasks.length}\n\n`;
+
+                tasks.forEach(task => {
+                    message += `🆔 ${task.id}. ${task.title}\n`;
+                    message += `   💰 ${task.reward}⭐ | ${task.type}\n`;
+                    message += `   📝 ${task.description.substring(0, 30)}...\n`;
+                    message += `   🟢 ${task.isAvailable ? 'Доступно' : 'Недоступно'}\n`;
+
+                    if (task.channelUsername) {
+                        message += `   📢 ${task.channelUsername}\n`;
+                    }
+                    message += '\n';
+                });
+
+                await ctx.reply(message, { parse_mode: 'Markdown' });
+
+            } catch (error) {
+                console.error('❌ Error in check_tasks:', error);
+                await ctx.reply(`❌ Ошибка: ${(error as Error).message}`);
+            }
+        });
         // Команда для синхронизации
         this.bot.command('sync_sheets', async (ctx) => {
             if (ctx.from.id !== this.adminId) {
@@ -686,6 +2057,70 @@ class StarBot {
         this.bot.action('show_balance', async (ctx) => {
             await ctx.answerCbQuery();
             await this.showUserBalance(ctx);
+        });
+
+        this.bot.command('tasks', async (ctx) => {
+            await this.showTasksMenu(ctx);
+        });
+
+        this.bot.action('show_tasks', async (ctx) => {
+            await ctx.answerCbQuery('🎯 Ищу задание для вас...');
+            await this.showTasksMenu(ctx); // Будет показывать одно задание
+        });
+
+        // Обновленный обработчик для "Мои задания"
+        this.bot.action('my_tasks', async (ctx) => {
+            await ctx.answerCbQuery();
+            await this.showUserTasks(ctx);
+        });
+
+        // Обработчик для получения другого задания
+        this.bot.action('get_another_task', async (ctx) => {
+            await ctx.answerCbQuery('🔄 Ищу другое задание...');
+            await this.showTasksMenu(ctx);
+        });
+
+        this.bot.action('refresh_tasks', async (ctx) => {
+            await ctx.answerCbQuery('🔄 Загружаю новые задания...');
+            await this.showTasksMenu(ctx);
+        });
+
+        // Или добавьте отдельный обработчик для рандомного обновления:
+        this.bot.action('refresh_tasks_random', async (ctx) => {
+            await ctx.answerCbQuery('🎲 Меняю задания...');
+            await this.showTasksMenu(ctx);
+        });
+
+        this.bot.action('my_tasks', async (ctx) => {
+            await ctx.answerCbQuery();
+            await this.showUserTasks(ctx);
+        });
+
+        this.bot.action('refresh_my_tasks', async (ctx) => {
+            await ctx.answerCbQuery('🔄 Обновляю...');
+            await this.showUserTasks(ctx);
+        });
+
+        // Обработчик для показа конкретного задания
+        this.bot.action(/^show_task_(\d+)$/, async (ctx) => {
+            const taskId = parseInt(ctx.match[1]);
+            await this.showTaskDetails(ctx, taskId);
+        });
+        this.bot.action('next_task', async (ctx) => {
+            await ctx.answerCbQuery('🎯 Ищу следующее задание...');
+            await this.showTasksMenu(ctx);
+        });
+
+        // Обработчик для проверки подписки на канал
+        this.bot.action(/^verify_subscription_(\d+)$/, async (ctx) => {
+            const taskId = parseInt(ctx.match[1]);
+            await this.verifyChannelSubscription(ctx, taskId);
+        });
+
+        // Обработчик для проверки подписки на бота
+        this.bot.action(/^verify_bot_subscription_(\d+)$/, async (ctx) => {
+            const taskId = parseInt(ctx.match[1]);
+            await this.verifyBotSubscription(ctx, taskId);
         });
         // Команда для открытия таблицы
         this.bot.command('sheet', async (ctx) => {
@@ -1161,6 +2596,55 @@ class StarBot {
             await ctx.answerCbQuery('❌ Ошибка при загрузке игры');
         }
     }
+
+    private async completeTaskAndOfferNext(ctx: BotContext, taskId: number, reward: number): Promise<void> {
+        try {
+            const user = ctx.user!;
+
+            // Находим следующее задание
+            const nextTask = await this.getNextTaskForUser(user.id);
+
+            let message = `🎉 *Задание выполнено!*\n\n`;
+            message += `✅ Вы успешно выполнили задание\n`;
+            message += `💰 Получено: ${reward} ⭐\n`;
+            message += `📊 Ваш баланс: ${user.stars} ⭐\n\n`;
+
+            let keyboard = {
+                inline_keyboard: [] as any[]
+            };
+
+            if (nextTask) {
+                message += `🎯 *Доступно следующее задание!*\n`;
+                message += `Вы можете получить его прямо сейчас.`;
+
+                keyboard.inline_keyboard.push([
+                    { text: '➡️ Перейти к следующему заданию', callback_data: 'show_tasks' }
+                ]);
+                keyboard.inline_keyboard.push([
+                    { text: '📊 Моя статистика', callback_data: 'my_tasks' },
+                    { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                ]);
+            } else {
+                message += `🎉 *Вы выполнили все доступные задания!*\n`;
+                message += `🔄 Новые задания появятся позже.\n`;
+                message += `Возвращайтесь через некоторое время!`;
+
+                keyboard.inline_keyboard.push([
+                    { text: '📊 Моя статистика', callback_data: 'my_tasks' }
+                ]);
+                keyboard.inline_keyboard.push([
+                    { text: '🏠 В меню', callback_data: 'back_to_menu' }
+                ]);
+            }
+
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+            });
+        } catch (error) {
+            console.error('❌ Error completing task:', error);
+        }
+    }
     private async showUserWithdrawals(ctx: BotContext): Promise<void> {
         try {
             const user = ctx.user!;
@@ -1483,12 +2967,14 @@ class StarBot {
                 `*Основные команды:*\n` +
                 `/start - Запустить бота\n` +
                 `/games - Все доступные игры\n` +
+                `/tasks - Доступные задания\n` + // НОВАЯ КОМАНДА
                 `/balance - Показать баланс\n` +
                 `/withdraw - Вывод средств\n` + // ← Добавлено
                 `/referral - Реферальная система\n` +
                 `/help - Эта справка\n\n` +
                 `*Кнопки в меню:*\n` +
                 `🎮 Играть - Открыть список игр\n` +
+                `📋 Задания - Выполнять задания за звезды\n` + // НОВАЯ КНОПКА
                 `👥 Звёзды за друзей - Пригласить друзей\n` +
                 `💰 Вывод средств - Вывести заработанное\n` +
                 `❓ Помощь - Эта справка\n` +
@@ -1719,13 +3205,14 @@ class StarBot {
             const keyboard = Markup.inlineKeyboard([
                 [
                     Markup.button.callback('🎮 Играть', 'play_games'),
-                    Markup.button.callback('👥 Звёзды за друзей', 'show_referrals')
+                    Markup.button.callback('🎯 Задание', 'show_tasks') // Одна кнопка для одного задания
                 ],
                 [
+                    Markup.button.callback('👥 Звёзды за друзей', 'show_referrals'),
                     Markup.button.callback('💰 Вывод средств', 'withdraw'),
-                    Markup.button.callback('📋 Мои заявки', 'show_my_withdrawals') // ← НОВАЯ КНОПКА
                 ],
                 [
+                    Markup.button.callback('📋 Мои заявки', 'show_my_withdrawals'), // ← НОВАЯ КНОПКА
                     Markup.button.callback('❓ Помощь', 'show_help')
                 ]
             ]);
@@ -3734,6 +5221,84 @@ class StarBot {
             await ctx.answerCbQuery('❌ Ошибка обработки капчи');
         }
     }
+    private async handleRewardInput(ctx: BotContext): Promise<void> {
+        console.log(`🎯 Обработка ввода награды для сессии:`, ctx.session);
+
+        const session = ctx.session || {};
+        const taskId = session.waitingForReward;
+
+        if (!taskId) {
+            console.log('❌ Нет taskId в сессии');
+            return;
+        }
+
+        // Проверяем что это текстовое сообщение
+        if (!('text' in ctx.message!)) {
+            console.log('❌ Сообщение не содержит текст');
+            return;
+        }
+
+        const text = ctx.message.text;
+        console.log(`💰 Ввод награды для задания ${taskId}: ${text}`);
+
+        const newReward = parseInt(text);
+
+        if (isNaN(newReward) || newReward < 1) {
+            await ctx.reply('❌ Некорректная сумма. Введите положительное число.');
+            return;
+        }
+
+        try {
+            const taskRepository = AppDataSource.getRepository(Task);
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+
+            if (!task) {
+                await ctx.reply('❌ Задание не найдено');
+                return;
+            }
+
+            const oldReward = task.reward;
+            task.reward = newReward;
+            await taskRepository.save(task);
+
+            console.log(`✅ Награда задания ${taskId} изменена с ${oldReward} на ${newReward}`);
+
+            // Удаляем сообщение с запросом награды
+            if (session.rewardMessageId) {
+                try {
+                    await this.bot.telegram.deleteMessage(ctx.chat!.id, session.rewardMessageId);
+                } catch (e) {
+                    console.log('⚠️ Не удалось удалить сообщение запроса:', e);
+                }
+            }
+
+            // Удаляем сообщение пользователя
+            try {
+                await this.bot.telegram.deleteMessage(ctx.chat!.id, ctx.message.message_id);
+            } catch (e) {
+                console.log('⚠️ Не удалось удалить сообщение пользователя:', e);
+            }
+
+            await ctx.reply(
+                `✅ Награда изменена!\n\n` +
+                `Задание: ${task.title}\n` +
+                `Старая награда: ${oldReward} ⭐\n` +
+                `Новая награда: ${newReward} ⭐`
+            );
+
+            // Обновляем основное сообщение
+            await this.updateTaskInfoMessage(ctx, taskId);
+
+            // Сбрасываем состояние
+            delete session.waitingForReward;
+            delete session.rewardMessageId;
+            delete session.rewardTimeout;
+
+        } catch (error) {
+            console.error('❌ Error setting reward:', error);
+            await ctx.reply('❌ Ошибка при изменении награды');
+        }
+    }
     private async completeRegistrationWithCaptcha(ctx: BotContext): Promise<void> {
         try {
             const user = ctx.user!;
@@ -3840,10 +5405,1108 @@ class StarBot {
         // Обработка админ команд
         this.setupAdminHandlers();
     }
+    // В StarBot классе добавьте:
+    private async processReferralTask(userId: number, taskId: number): Promise<void> {
+        try {
+            const userRepository = AppDataSource.getRepository(User);
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
 
+            // Проверяем, не выполнял ли уже пользователь это задание
+            const existingTask = await userTaskRepository.findOne({
+                where: {
+                    userId,
+                    taskId,
+                    status: 'completed'
+                }
+            });
+
+            if (existingTask) {
+                console.log(`⚠️ User ${userId} already completed task ${taskId}`);
+                return;
+            }
+
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+            const user = await userRepository.findOne({ where: { id: userId } });
+
+            if (!task || !user) {
+                console.log(`❌ Task ${taskId} or user ${userId} not found`);
+                return;
+            }
+
+            // Ждем 2 минуты (в реальности это должно быть через вебхук)
+            console.log(`⏳ Task ${taskId} for user ${userId} will be completed in 2 minutes`);
+
+            // В реальности здесь должен быть вебхук от сайта
+            // Пока эмулируем успешное выполнение через 2 минуты
+            setTimeout(async () => {
+                try {
+                    // Создаем запись о выполнении
+                    const userTask = userTaskRepository.create({
+                        userId,
+                        taskId,
+                        status: 'completed',
+                        completedAt: new Date()
+                    });
+
+                    await userTaskRepository.save(userTask);
+
+                    // Начисляем награду
+                    user.stars += task.reward;
+                    user.totalEarned += task.reward;
+                    await userRepository.save(user);
+
+                    // Обновляем счетчик заданий
+                    task.totalCompletions += 1;
+                    await taskRepository.save(task);
+
+                    console.log(`✅ Task ${taskId} completed for user ${userId}, +${task.reward} stars`);
+
+                    // Уведомляем пользователя
+                    try {
+                        await this.bot.telegram.sendMessage(
+                            user.telegramId,
+                            `🎉 *Задание выполнено!*\n\n` +
+                            `✅ Вы успешно выполнили задание: "${task.title}"\n` +
+                            `💰 Получено: ${task.reward} ⭐\n` +
+                            `📊 Ваш баланс: ${user.stars} ⭐`,
+                            { parse_mode: 'Markdown' }
+                        );
+                    } catch (notificationError) {
+                        console.error('❌ Error sending notification:', notificationError);
+                    }
+
+                } catch (error) {
+                    console.error(`❌ Error completing task ${taskId}:`, error);
+                }
+            }, 2 * 60 * 1000); // 2 минуты
+
+        } catch (error) {
+            console.error('❌ Error processing referral task:', error);
+        }
+    }
     private setupAdminHandlers() {
         // ============ СУЩЕСТВУЮЩИЙ КОД (не удаляем) ============
+        this.bot.action(/^admin_toggle_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
 
+            const taskId = parseInt(ctx.match[1]);
+            await ctx.answerCbQuery('🔄 Переключаем доступность...');
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.answerCbQuery('❌ Задание не найдено');
+                    return;
+                }
+
+                // Переключаем доступность
+                task.isAvailable = !task.isAvailable;
+                await taskRepository.save(task);
+
+                await ctx.answerCbQuery(`✅ Задание ${task.isAvailable ? 'показано' : 'скрыто'}`);
+
+                // Обновляем сообщение
+                await this.updateTaskInfoMessage(ctx, taskId);
+
+            } catch (error) {
+                console.error('❌ Error in admin_toggle handler:', error);
+                await ctx.answerCbQuery('❌ Ошибка');
+            }
+        });
+
+        // Обработчик для кнопки "Изменить награду"
+        // Обработчик для кнопки "Изменить награду"
+        // Обработчик для кнопки "Изменить награду"
+        this.bot.action(/^admin_reward_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+
+            // Устанавливаем флаг, что ждем ввод новой награды
+            ctx.session = ctx.session || {};
+            ctx.session.waitingForReward = taskId;
+
+            await ctx.answerCbQuery('💰 Введите новую награду в чат');
+
+            const message = await ctx.reply(
+                `💰 *Изменение награды для задания #${taskId}*\n\n` +
+                `Введите новое количество звезд:\n` +
+                `Пример: 25\n\n` +
+                `⚠️ Чтобы отменить, отправьте "отмена"\n` +
+                `⚠️ Это временный режим ввода.`,
+                { parse_mode: 'Markdown' }
+            );
+
+            // Сохраняем ID сообщения для удаления
+            ctx.session.rewardMessageId = message.message_id;
+
+            // Также сохраняем время, чтобы можно было очистить через время
+            ctx.session.rewardTimeout = Date.now();
+        });
+
+        // Обработчик для кнопки "Изменить статус"
+        this.bot.action(/^admin_status_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🟢 Активное', callback_data: `set_status_${taskId}_active` },
+                        { text: '⚪ Неактивное', callback_data: `set_status_${taskId}_inactive` }
+                    ],
+                    [
+                        { text: '✅ Завершенное', callback_data: `set_status_${taskId}_completed` },
+                        { text: '❌ Отмена', callback_data: `cancel_status_${taskId}` }
+                    ]
+                ]
+            };
+
+            await ctx.answerCbQuery('📊 Выберите новый статус');
+
+            try {
+                await ctx.reply(
+                    `📊 *Изменение статуса задания*\n\n` +
+                    `Выберите новый статус для задания #${taskId}:`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard }
+                );
+            } catch (error) {
+                // Игнорируем если уже есть активное сообщение
+            }
+        });
+
+        // Обработчик для кнопки "Удалить"
+        this.bot.action(/^admin_delete_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '✅ Да, удалить', callback_data: `confirm_delete_${taskId}` },
+                        { text: '❌ Отмена', callback_data: `cancel_delete_${taskId}` }
+                    ]
+                ]
+            };
+
+            await ctx.answerCbQuery('🗑️ Подтвердите удаление');
+
+            try {
+                await ctx.reply(
+                    `⚠️ *Подтверждение удаления*\n\n` +
+                    `Вы действительно хотите удалить задание #${taskId}?\n` +
+                    `Это действие нельзя отменить!`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard }
+                );
+            } catch (error) {
+                // Игнорируем если уже есть активное сообщение
+            }
+        });
+
+        // Обработчик для кнопки "Все задания"
+        this.bot.action('admin_list_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            await ctx.answerCbQuery('📋 Загружаю список заданий...');
+
+            // Используем вызов команды через бота
+            await this.bot.telegram.sendMessage(
+                ctx.chat!.id,
+                '/list_tasks'
+            );
+        });
+        // ============ ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ ============
+
+        this.bot.action(/^set_status_(\d+)_(.+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+            const status = ctx.match[2] as TaskStatus; // ← ВАЖНО: приведение к типу
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.answerCbQuery('❌ Задание не найдено');
+                    return;
+                }
+
+                const oldStatus = task.status;
+                task.status = status;
+                await taskRepository.save(task);
+
+                await ctx.answerCbQuery(`✅ Статус изменен: ${status}`);
+
+                // Удаляем сообщение выбора статуса
+                if (ctx.callbackQuery?.message) {
+                    try {
+                        await ctx.deleteMessage();
+                    } catch (e) {
+                        // Игнорируем ошибку удаления
+                    }
+                }
+
+                // Обновляем основное сообщение с информацией о задании
+                await this.updateTaskInfoMessage(ctx, taskId);
+
+            } catch (error) {
+                console.error('❌ Error in set_status handler:', error);
+                await ctx.answerCbQuery('❌ Ошибка');
+            }
+        });
+
+        // Обработчик для подтверждения удаления (ИСПРАВЛЕННЫЙ)
+        this.bot.action(/^confirm_delete_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                await taskRepository.delete(taskId);
+
+                await ctx.answerCbQuery('✅ Задание удалено');
+
+                // Удаляем сообщение подтверждения
+                if (ctx.callbackQuery?.message) {
+                    try {
+                        await ctx.deleteMessage();
+                    } catch (e) {
+                        // Игнорируем ошибку удаления
+                    }
+                }
+
+                // Просто отправляем новое сообщение
+                await ctx.reply(`✅ Задание #${taskId} удалено`);
+
+            } catch (error) {
+                console.error('❌ Error in confirm_delete handler:', error);
+                await ctx.answerCbQuery('❌ Ошибка удаления');
+            }
+        });
+
+        // Обработчик для отмены действий
+        this.bot.action(/^cancel_(status|delete)_(\d+)$/, async (ctx) => {
+            await ctx.answerCbQuery('❌ Операция отменена');
+
+            // Удаляем сообщение с выбором
+            if (ctx.callbackQuery?.message) {
+                try {
+                    await ctx.deleteMessage();
+                } catch (e) {
+                    // Игнорируем ошибку удаления
+                }
+            }
+        });
+        // ============ ДОБАВЬ ЭТОТ ХЕНДЛЕР ДЛЯ ВВОДА НАГРАДЫ ============
+
+        // ============ ОБРАБОТЧИК ВВОДА НАГРАДЫ ============
+
+        this.bot.use(async (ctx, next) => {
+            // Проверяем что это текстовое сообщение
+            if (!ctx.message || !('text' in ctx.message)) {
+                return next();
+            }
+
+            const text = ctx.message.text;
+            const session = ctx.session || {};
+
+            // Если ждем ввод награды и сообщение содержит только цифры
+            if (session.waitingForReward && /^\d+$/.test(text)) {
+                await this.handleRewardInput(ctx);
+                return; // Не передаем дальше
+            }
+
+            return next();
+        });
+
+        // Отдельный обработчик для отмены
+        this.bot.hears(/^(отмена|cancel|стоп|stop)$/i, async (ctx) => {
+            const session = ctx.session || {};
+            if (session.waitingForReward) {
+                console.log(`❌ Отмена ввода награды для задания ${session.waitingForReward}`);
+
+                // Удаляем сообщение с запросом
+                if (session.rewardMessageId) {
+                    try {
+                        await this.bot.telegram.deleteMessage(ctx.chat!.id, session.rewardMessageId);
+                    } catch (e) {
+                        console.log('⚠️ Не удалось удалить сообщение запроса:', e);
+                    }
+                }
+
+                // Удаляем сообщение пользователя
+                try {
+                    await this.bot.telegram.deleteMessage(ctx.chat!.id, ctx.message.message_id);
+                } catch (e) {
+                    console.log('⚠️ Не удалось удалить сообщение пользователя:', e);
+                }
+
+                await ctx.reply('❌ Изменение награды отменено');
+
+                // Сбрасываем состояние
+                delete session.waitingForReward;
+                delete session.rewardMessageId;
+                delete session.rewardTimeout;
+            }
+        });
+
+        this.bot.command('delete_task', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const args = ctx.message.text.split(' ');
+
+            if (args.length !== 2) {
+                await ctx.reply(
+                    '🗑️ *Удаление задания*\n\n' +
+                    'Использование:\n' +
+                    '/delete_task <ID_задания>\n\n' +
+                    'Пример:\n' +
+                    '/delete_task 1\n\n' +
+                    '💡 Чтобы получить список заданий с ID:\n' +
+                    '/list_tasks'
+                );
+                return;
+            }
+
+            const taskId = parseInt(args[1]);
+
+            if (isNaN(taskId)) {
+                await ctx.reply('❌ ID задания должен быть числом');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.reply(`❌ Задание с ID ${taskId} не найдено`);
+                    return;
+                }
+
+                // Подтверждение удаления
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '✅ Да, удалить', callback_data: `confirm_delete_task_${taskId}` },
+                            { text: '❌ Отмена', callback_data: 'cancel_delete_task' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(
+                    `⚠️ *Подтверждение удаления*\n\n` +
+                    `Вы действительно хотите удалить задание?\n\n` +
+                    `🎯 *${task.title}*\n` +
+                    `💰 Награда: ${task.reward} ⭐\n` +
+                    `📝 Тип: ${this.getTaskTypeName(task.type)}\n\n` +
+                    `❌ Это действие нельзя отменить!`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard }
+                );
+
+            } catch (error) {
+                console.error('❌ Error in delete_task command:', error);
+                await ctx.reply('❌ Ошибка при поиске задания');
+            }
+        });
+
+        // Обработчик подтверждения удаления
+        this.bot.action(/^confirm_delete_task_(\d+)$/, async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskId = parseInt(ctx.match[1]);
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.answerCbQuery('❌ Задание не найдено');
+                    await ctx.editMessageText('❌ Задание не найдено');
+                    return;
+                }
+
+                const taskTitle = task.title;
+
+                // Удаляем задание
+                await taskRepository.delete(taskId);
+
+                // Также удаляем связанные записи
+                const userTaskRepository = AppDataSource.getRepository(UserTask);
+                await userTaskRepository.delete({ taskId });
+
+                const taskClickRepository = AppDataSource.getRepository(TaskClick);
+                await taskClickRepository.delete({ taskId });
+
+                await ctx.answerCbQuery('✅ Задание удалено');
+                await ctx.editMessageText(
+                    `✅ *Задание удалено*\n\n` +
+                    `🎯 Название: ${taskTitle}\n` +
+                    `🆔 ID: ${taskId}\n\n` +
+                    `🗑️ Все связанные данные также удалены.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error confirming task deletion:', error);
+                await ctx.answerCbQuery('❌ Ошибка удаления');
+                await ctx.editMessageText('❌ Ошибка при удалении задания');
+            }
+        });
+
+        // Обработчик отмены удаления
+        this.bot.action('cancel_delete_task', async (ctx) => {
+            await ctx.answerCbQuery('❌ Удаление отменено');
+            await ctx.editMessageText('✅ Удаление задания отменено');
+        });
+
+        // Команда для скрытия/показа задачи
+        this.bot.command('toggle_task', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const args = ctx.message.text.split(' ');
+
+            if (args.length !== 2) {
+                await ctx.reply(
+                    '👁️ *Скрытие/показа задания*\n\n' +
+                    'Использование:\n' +
+                    '/toggle_task <ID_задания>\n\n' +
+                    'Пример:\n' +
+                    '/toggle_task 1\n\n' +
+                    '💡 Команда переключает видимость задания для пользователей.'
+                );
+                return;
+            }
+
+            const taskId = parseInt(args[1]);
+
+            if (isNaN(taskId)) {
+                await ctx.reply('❌ ID задания должен быть числом');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.reply(`❌ Задание с ID ${taskId} не найдено`);
+                    return;
+                }
+
+                // Переключаем доступность
+                task.isAvailable = !task.isAvailable;
+                await taskRepository.save(task);
+
+                const status = task.isAvailable ? 'доступно' : 'скрыто';
+                const emoji = task.isAvailable ? '👁️' : '👁️‍🗨️';
+
+                await ctx.reply(
+                    `${emoji} *Статус задания обновлен*\n\n` +
+                    `🎯 Название: ${task.title}\n` +
+                    `🆔 ID: ${task.id}\n` +
+                    `📊 Статус: ${status}\n\n` +
+                    `💡 Задание теперь ${task.isAvailable ? 'видно' : 'скрыто'} для пользователей.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error in toggle_task command:', error);
+                await ctx.reply('❌ Ошибка при обновлении задания');
+            }
+        });
+
+        // Команда для изменения статуса задачи
+        this.bot.command('set_task_status', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const args = ctx.message.text.split(' ');
+
+            if (args.length !== 3) {
+                await ctx.reply(
+                    '📊 *Изменение статуса задания*\n\n' +
+                    'Использование:\n' +
+                    '/set_task_status <ID_задания> <статус>\n\n' +
+                    'Доступные статусы:\n' +
+                    '• active - активное\n' +
+                    '• inactive - неактивное\n' +
+                    '• completed - завершенное\n\n' +
+                    'Пример:\n' +
+                    '/set_task_status 1 active'
+                );
+                return;
+            }
+
+            const taskId = parseInt(args[1]);
+            const status = args[2].toLowerCase();
+
+            if (isNaN(taskId)) {
+                await ctx.reply('❌ ID задания должен быть числом');
+                return;
+            }
+
+            const validStatuses = ['active', 'inactive', 'completed'];
+            if (!validStatuses.includes(status)) {
+                await ctx.reply(`❌ Неверный статус. Допустимые значения: ${validStatuses.join(', ')}`);
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.reply(`❌ Задание с ID ${taskId} не найдено`);
+                    return;
+                }
+
+                // Изменяем статус
+                task.status = status as any;
+                await taskRepository.save(task);
+
+                const statusNames: Record<string, string> = {
+                    'active': 'активное',
+                    'inactive': 'неактивное',
+                    'completed': 'завершенное'
+                };
+
+                await ctx.reply(
+                    `📊 *Статус задания изменен*\n\n` +
+                    `🎯 Название: ${task.title}\n` +
+                    `🆔 ID: ${task.id}\n` +
+                    `📝 Старый статус: ${task.status}\n` +
+                    `✅ Новый статус: ${statusNames[status] || status}\n\n` +
+                    `💡 Задание теперь ${statusNames[status] || status} для пользователей.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error in set_task_status command:', error);
+                await ctx.reply('❌ Ошибка при изменении статуса задания');
+            }
+        });
+
+        // Команда для изменения награды
+        this.bot.command('set_task_reward', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const args = ctx.message.text.split(' ');
+
+            if (args.length !== 3) {
+                await ctx.reply(
+                    '💰 *Изменение награды задания*\n\n' +
+                    'Использование:\n' +
+                    '/set_task_reward <ID_задания> <награда>\n\n' +
+                    'Пример:\n' +
+                    '/set_task_reward 1 50'
+                );
+                return;
+            }
+
+            const taskId = parseInt(args[1]);
+            const reward = parseInt(args[2]);
+
+            if (isNaN(taskId)) {
+                await ctx.reply('❌ ID задания должен быть числом');
+                return;
+            }
+
+            if (isNaN(reward) || reward < 1) {
+                await ctx.reply('❌ Награда должна быть положительным числом');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.reply(`❌ Задание с ID ${taskId} не найдено`);
+                    return;
+                }
+
+                const oldReward = task.reward;
+
+                // Изменяем награду
+                task.reward = reward;
+                await taskRepository.save(task);
+
+                await ctx.reply(
+                    `💰 *Награда задания изменена*\n\n` +
+                    `🎯 Название: ${task.title}\n` +
+                    `🆔 ID: ${task.id}\n` +
+                    `📝 Старая награда: ${oldReward} ⭐\n` +
+                    `✅ Новая награда: ${reward} ⭐\n\n` +
+                    `💡 Задание теперь дает ${reward} звезд за выполнение.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error in set_task_reward command:', error);
+                await ctx.reply('❌ Ошибка при изменении награды задания');
+            }
+        });
+
+        // Команда для просмотра детальной информации о задании
+        this.bot.command('task_info', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const args = ctx.message.text.split(' ');
+
+            if (args.length !== 2) {
+                await ctx.reply(
+                    '📋 *Информация о задании*\n\n' +
+                    'Использование:\n' +
+                    '/task_info <ID_задания>\n\n' +
+                    'Пример:\n' +
+                    '/task_info 1'
+                );
+                return;
+            }
+
+            const taskId = parseInt(args[1]);
+
+            if (isNaN(taskId)) {
+                await ctx.reply('❌ ID задания должен быть числом');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+                const task = await taskRepository.findOne({ where: { id: taskId } });
+
+                if (!task) {
+                    await ctx.reply(`❌ Задание с ID ${taskId} не найдено`);
+                    return;
+                }
+
+                // Получаем статистику выполнения
+                const completedCount = await userTaskRepository.count({
+                    where: {
+                        taskId,
+                        status: 'completed'
+                    }
+                });
+
+                const pendingCount = await userTaskRepository.count({
+                    where: {
+                        taskId,
+                        status: 'pending'
+                    }
+                });
+
+                // Формируем сообщение
+                let message = `📋 *Детальная информация о задании*\n\n`;
+                message += `🆔 ID: ${task.id}\n`;
+                message += `🎯 Название: ${task.title}\n`;
+                message += `📝 Описание: ${task.description}\n\n`;
+
+                message += `💰 *Награда:* ${task.reward} ⭐\n`;
+                message += `📊 *Тип:* ${this.getTaskTypeName(task.type)}\n`;
+                message += `📈 *Статус:* ${task.status}\n`;
+                message += `👁️ *Доступно:* ${task.isAvailable ? 'Да' : 'Нет'}\n\n`;
+
+                if (task.channelUsername) {
+                    message += `📢 *Канал:* ${task.channelUsername}\n`;
+                }
+                if (task.botUsername) {
+                    message += `🤖 *Бот:* ${task.botUsername}\n`;
+                }
+                if (task.targetUrl) {
+                    message += `🔗 *URL:* ${task.targetUrl}\n`;
+                }
+
+                message += `\n📊 *Статистика выполнения:*\n`;
+                message += `✅ Выполнено: ${completedCount} раз\n`;
+                message += `⏳ В ожидании: ${pendingCount}\n`;
+                message += `🎯 Всего выполнений: ${task.totalCompletions}\n`;
+                message += `🔢 Максимум: ${task.maxCompletions} раз на пользователя\n\n`;
+
+                if (task.expirationDate) {
+                    const expiryDate = new Date(task.expirationDate);
+                    message += `⏰ *Срок действия:* ${expiryDate.toLocaleDateString('ru-RU')}\n`;
+                } else {
+                    message += `⏰ *Срок действия:* Бессрочно\n`;
+                }
+
+                message += `📅 *Создано:* ${task.createdAt.toLocaleDateString('ru-RU')}\n`;
+                message += `🔄 *Обновлено:* ${task.updatedAt.toLocaleDateString('ru-RU')}\n\n`;
+
+                message += `⚡ *Быстрые действия:*\n`;
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '👁️ Скрыть/показать', callback_data: `admin_toggle_${taskId}` },
+                            // { text: '💰 Изменить награду', callback_data: `admin_reward_${taskId}` }
+                        ],
+                        [
+                            { text: '📊 Изменить статус', callback_data: `admin_status_${taskId}` },
+                            { text: '🗑️ Удалить', callback_data: `admin_delete_${taskId}` }
+                        ],
+                        [
+                            { text: '📋 Все задания', callback_data: 'admin_list_tasks' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(message, {
+                    parse_mode: 'HTML',  // ← ИЗМЕНИЛОСЬ
+                    reply_markup: keyboard
+                });
+
+            } catch (error) {
+                console.error('❌ Error in task_info command:', error);
+                await ctx.reply('❌ Ошибка при получении информации о задании');
+            }
+        });
+
+        // Команда для массового управления заданиями
+        this.bot.command('bulk_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            await ctx.reply(
+                '⚡ *Массовое управление заданиями*\n\n' +
+                'Выберите действие:\n\n' +
+                '📋 *Список команд:*\n' +
+                '• /list_tasks - все задания\n' +
+                '• /active_tasks - только активные\n' +
+                '• /inactive_tasks - только неактивные\n' +
+                '• /delete_expired_tasks - удалить истекшие\n' +
+                '• /deactivate_all_tasks - деактивировать все\n' +
+                '• /activate_all_tasks - активировать все\n\n' +
+                '🎯 *Управление конкретными заданиями:*\n' +
+                '• /task_info ID - информация о задании\n' +
+                '• /delete_task ID - удалить задание\n' +
+                '• /toggle_task ID - скрыть/показать\n' +
+                '• /set_task_status ID статус - изменить статус\n' +
+                '• /set_task_reward ID награда - изменить награду\n\n' +
+                '➕ *Создание заданий:*\n' +
+                '• /add_task - добавить новое задание\n' +
+                { parse_mode: 'Markdown' }
+            );
+        });
+
+        // Команда для удаления истекших заданий
+        this.bot.command('delete_expired_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const now = new Date();
+
+                // Находим истекшие задания
+                const expiredTasks = await taskRepository.find({
+                    where: {
+                        expirationDate: LessThan(now),
+                        status: 'active'
+                    }
+                });
+
+                if (expiredTasks.length === 0) {
+                    await ctx.reply('✅ Нет истекших заданий для удаления');
+                    return;
+                }
+
+                // Подтверждение
+                let message = `⚠️ *Подтверждение массового удаления*\n\n`;
+                message += `Найдено истекших заданий: ${expiredTasks.length}\n\n`;
+                message += `Список заданий для удаления:\n`;
+
+                expiredTasks.forEach(task => {
+                    const expiryDate = task.expirationDate ? new Date(task.expirationDate).toLocaleDateString('ru-RU') : 'Нет';
+                    message += `• ${task.id}. ${task.title} (истекло: ${expiryDate})\n`;
+                });
+
+                message += `\n❌ Это действие нельзя отменить!`;
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '✅ Да, удалить все', callback_data: 'confirm_delete_expired' },
+                            { text: '❌ Отмена', callback_data: 'cancel_delete_expired' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(message, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+
+            } catch (error) {
+                console.error('❌ Error in delete_expired_tasks command:', error);
+                await ctx.reply('❌ Ошибка при поиске истекших заданий');
+            }
+        });
+
+        // Обработчики для массовых действий
+        this.bot.action('confirm_delete_expired', async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const now = new Date();
+
+                // Удаляем истекшие задания
+                const result = await taskRepository
+                    .createQueryBuilder()
+                    .delete()
+                    .from(Task)
+                    .where('expirationDate < :now', { now })
+                    .andWhere('status = :status', { status: 'active' })
+                    .execute();
+
+                await ctx.answerCbQuery('✅ Задания удалены');
+                await ctx.editMessageText(
+                    `✅ *Массовое удаление завершено*\n\n` +
+                    `🗑️ Удалено заданий: ${result.affected || 0}\n\n` +
+                    `💡 Истекшие задания были удалены из системы.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error confirming delete expired:', error);
+                await ctx.answerCbQuery('❌ Ошибка удаления');
+                await ctx.editMessageText('❌ Ошибка при массовом удалении заданий');
+            }
+        });
+
+        this.bot.action('cancel_delete_expired', async (ctx) => {
+            await ctx.answerCbQuery('❌ Удаление отменено');
+            await ctx.editMessageText('✅ Массовое удаление отменено');
+        });
+
+        // Команда для деактивации всех заданий
+        this.bot.command('deactivate_all_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const count = await taskRepository.count({ where: { status: 'active' } });
+
+                if (count === 0) {
+                    await ctx.reply('✅ Нет активных заданий для деактивации');
+                    return;
+                }
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: '✅ Да, деактивировать все', callback_data: 'confirm_deactivate_all' },
+                            { text: '❌ Отмена', callback_data: 'cancel_deactivate_all' }
+                        ]
+                    ]
+                };
+
+                await ctx.reply(
+                    `⚠️ *Подтверждение массовой деактивации*\n\n` +
+                    `Количество активных заданий: ${count}\n\n` +
+                    `Вы действительно хотите деактивировать ВСЕ активные задания?\n\n` +
+                    `💡 Задания станут недоступны для пользователей, но останутся в базе данных.`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard }
+                );
+
+            } catch (error) {
+                console.error('❌ Error in deactivate_all_tasks command:', error);
+                await ctx.reply('❌ Ошибка при подготовке деактивации');
+            }
+        });
+
+        // Обработчик подтверждения деактивации всех заданий
+        this.bot.action('confirm_deactivate_all', async (ctx) => {
+            if (!this.isAdmin(ctx.from!.id)) {
+                await ctx.answerCbQuery('⛔ У вас нет прав');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+
+                // Деактивируем все активные задания
+                const result = await taskRepository
+                    .createQueryBuilder()
+                    .update(Task)
+                    .set({ status: 'inactive' })
+                    .where('status = :status', { status: 'active' })
+                    .execute();
+
+                await ctx.answerCbQuery('✅ Задания деактивированы');
+                await ctx.editMessageText(
+                    `✅ *Массовая деактивация завершена*\n\n` +
+                    `📊 Деактивировано заданий: ${result.affected || 0}\n\n` +
+                    `💡 Все задания теперь имеют статус "inactive" и не видны пользователям.`,
+                    { parse_mode: 'Markdown' }
+                );
+
+            } catch (error) {
+                console.error('❌ Error confirming deactivate all:', error);
+                await ctx.answerCbQuery('❌ Ошибка деактивации');
+                await ctx.editMessageText('❌ Ошибка при массовой деактивации заданий');
+            }
+        });
+
+        this.bot.command('add_task', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав');
+                return;
+            }
+
+            // Формат: /add_task type=channel_subscription title="Подписка" description="..." reward=10 channel=@channelname
+            const args = ctx.message.text.split(' ');
+
+            if (args.length < 2) {
+                await ctx.reply(
+                    '📝 *Добавление задания*\n\n' +
+                    'Формат:\n' +
+                    '/add_task type=<тип> title="Название" description="Описание" reward=<число>\n\n' +
+                    '*Типы:*\n' +
+                    '• channel_subscription - Подписка на канал\n' +
+                    '• bot_subscription - Подписка на бота\n' +
+                    '• referral_click - Переход по ссылке\n\n' +
+                    '*Примеры:*\n' +
+                    '/add_task type=channel_subscription title="Подписка на новости" description="Подпишитесь на наш канал" reward=15 channel=@mychannel\n' +
+                    '/add_task type=referral_click title="Посетите сайт" description="Перейдите по ссылке и оставайтесь 2 минуты" reward=20 url=https://example.com\n'
+                );
+                return;
+            }
+
+            try {
+                const params: any = {};
+
+                for (let i = 1; i < args.length; i++) {
+                    if (args[i].includes('=')) {
+                        const [key, value] = args[i].split('=');
+                        params[key] = value.replace(/"/g, '');
+                    }
+                }
+
+                const taskRepository = AppDataSource.getRepository(Task);
+
+                const task = taskRepository.create({
+                    title: params.title || 'Новое задание',
+                    description: params.description || '',
+                    type: params.type as any || 'channel_subscription',
+                    reward: parseInt(params.reward) || 10,
+                    channelUsername: params.channel || params.channelUsername,
+                    botUsername: params.bot || params.botUsername,
+                    targetUrl: params.url || params.targetUrl,
+                    maxCompletions: parseInt(params.max) || 1,
+                    status: 'active',
+                    isAvailable: true
+                });
+
+                await taskRepository.save(task);
+
+                await ctx.reply(
+                    `✅ *Задание добавлено!*\n\n` +
+                    `🎯 Название: ${task.title}\n` +
+                    `💰 Награда: ${task.reward} ⭐\n` +
+                    `📝 Тип: ${this.getTaskTypeName(task.type)}\n` +
+                    `🆔 ID: ${task.id}\n\n` +
+                    `Пользователи теперь могут выполнять это задание.`
+                );
+
+            } catch (error) {
+                console.error('❌ Error adding task:', error);
+                await ctx.reply('❌ Ошибка добавления задания');
+            }
+        });
+
+        this.bot.command('list_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав');
+                return;
+            }
+
+            const taskRepository = AppDataSource.getRepository(Task);
+            const tasks = await taskRepository.find({ order: { id: 'DESC' }, take: 10 });
+
+            if (tasks.length === 0) {
+                await ctx.reply('📭 Нет заданий');
+                return;
+            }
+
+            let message = '📋 *Последние 10 заданий:*\n\n';
+
+            tasks.forEach(task => {
+                message += `🆔 ${task.id}. ${task.title}\n`;
+                message += `   💰 ${task.reward}⭐ | ${this.getTaskTypeName(task.type)}\n`;
+                message += `   📊 Выполнено: ${task.totalCompletions} раз\n`;
+                message += `   🟢 ${task.isAvailable ? 'Активно' : 'Неактивно'}\n`;
+
+                if (task.channelUsername) {
+                    message += `   📢 ${task.channelUsername}\n`;
+                }
+                if (task.targetUrl) {
+                    message += `   🔗 ${task.targetUrl.substring(0, 30)}...\n`;
+                }
+
+                message += `\n`;
+            });
+
+            await ctx.reply(message, { parse_mode: 'Markdown' });
+        });
         // Статистика
         this.bot.hears('📊 Статистика', async (ctx) => {
             // ТОЛЬКО ДЛЯ АДМИНОВ
@@ -4186,6 +6849,7 @@ ${result.success ? '🎉 Все данные успешно синхронизи
 • /sync_status - Показать статус синхронизации
 
 <b>Управление таблицами:</b>
+• /admin_help_tasks - Помошь по задачам
 • /fix_sheet - Исправить таблицу выплат
 • /sheet - Открыть Google Sheets
 • /sync_all - Полная синхронизация
@@ -4207,6 +6871,123 @@ ${result.success ? '🎉 Все данные успешно синхронизи
 `;
 
             await ctx.reply(helpMessage, { parse_mode: 'HTML' });
+        });
+
+        this.bot.command('admin_help_tasks', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            const helpMessage = `
+<b>👑 АДМИН ПАНЕЛЬ - Управление заданиями</b>
+
+<b>📋 Просмотр заданий:</b>
+• /list_tasks - Все задания
+• /active_tasks - Только активные
+• /inactive_tasks - Только неактивные
+• /task_info ID - Детальная информация
+
+<b>➕ Создание заданий:</b>
+• /add_task - Добавить задание (расширенная форма)
+• /create_task_simple - Простая форма добавления
+
+<b>✏️ Редактирование заданий:</b>
+• /set_task_status ID статус - Изменить статус
+• /set_task_reward ID награда - Изменить награду
+• /toggle_task ID - Скрыть/показать задание
+
+<b>🗑️ Удаление заданий:</b>
+• /delete_task ID - Удалить конкретное задание
+• /delete_expired_tasks - Удалить все истекшие задания
+
+<b>⚡ Массовые действия:</b>
+• /deactivate_all_tasks - Деактивировать все задания
+• /bulk_tasks - Справка по массовым командам
+
+<b>📊 Статистика:</b>
+• /task_stats - Статистика выполнения заданий
+
+<b>💡 Быстрые команды:</b>
+• type=channel_subscription - Подписка на канал
+• type=referral_click - Переход по ссылке
+• type=bot_subscription - Подписка на бота
+
+<code>Примеры использования:</code>
+• /add_task type=channel_subscription title="Название" description="Описание" reward=10 channel=@username
+• /delete_task 1
+• /set_task_status 1 active
+• /toggle_task 1
+`;
+
+            await ctx.reply(helpMessage, { parse_mode: 'HTML' });
+        });
+
+        this.bot.command('task_stats', async (ctx) => {
+            if (!this.isAdmin(ctx.from.id)) {
+                await ctx.reply('⛔ У вас нет прав для выполнения этой команды');
+                return;
+            }
+
+            try {
+                const taskRepository = AppDataSource.getRepository(Task);
+                const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+                // Общая статистика
+                const totalTasks = await taskRepository.count();
+                const activeTasks = await taskRepository.count({ where: { status: 'active' } });
+                const completedTasks = await taskRepository.count({ where: { status: 'completed' } });
+
+                // Статистика выполнения
+                const totalCompletions = await userTaskRepository.count({ where: { status: 'completed' } });
+
+                // Самые популярные задания
+                const popularTasks = await taskRepository
+                    .createQueryBuilder('task')
+                    .orderBy('task.totalCompletions', 'DESC')
+                    .limit(5)
+                    .getMany();
+
+                let message = `<b>📊 Статистика системы заданий</b>\n\n`;
+
+                message += `<b>Общая статистика:</b>\n`;
+                message += `• Всего заданий: ${totalTasks}\n`;
+                message += `• Активных заданий: ${activeTasks}\n`;
+                message += `• Завершенных заданий: ${completedTasks}\n`;
+                message += `• Всего выполнений: ${totalCompletions}\n\n`;
+
+                if (popularTasks.length > 0) {
+                    message += `<b>🏆 Самые популярные задания:</b>\n`;
+                    popularTasks.forEach((task, index) => {
+                        message += `${index + 1}. ${task.title}\n`;
+                        message += `   🎯 Выполнено: ${task.totalCompletions} раз\n`;
+                        message += `   💰 Награда: ${task.reward} ⭐\n\n`;
+                    });
+                }
+
+                // Статистика по типам заданий
+                const typeStats = await taskRepository
+                    .createQueryBuilder('task')
+                    .select('task.type, COUNT(*) as count, SUM(task.totalCompletions) as completions, AVG(task.reward) as avg_reward')
+                    .groupBy('task.type')
+                    .getRawMany();
+
+                if (typeStats.length > 0) {
+                    message += `<b>📈 Статистика по типам:</b>\n`;
+                    typeStats.forEach(stat => {
+                        const typeName = this.getTaskTypeName(stat.task_type);
+                        message += `• ${typeName}: ${stat.count} заданий\n`;
+                        message += `  Выполнено: ${stat.completions || 0} раз\n`;
+                        message += `  Средняя награда: ${Math.round(stat.avg_reward || 0)} ⭐\n\n`;
+                    });
+                }
+
+                await ctx.reply(message, { parse_mode: 'HTML' });
+
+            } catch (error) {
+                console.error('❌ Error in task_stats command:', error);
+                await ctx.reply('❌ Ошибка при получении статистики');
+            }
         });
 
         // Обновляем существующую команду /sync_sheets для ясности
@@ -4321,6 +7102,100 @@ ${result.success ? '🎉 Все данные успешно синхронизи
                 await ctx.editMessageText('❌ Ошибка получения статуса');
             }
         });
+    }
+
+    private async updateTaskInfoMessage(ctx: BotContext, taskId: number): Promise<void> {
+        try {
+            // Получаем обновленную информацию о задании
+            const taskRepository = AppDataSource.getRepository(Task);
+            const userTaskRepository = AppDataSource.getRepository(UserTask);
+
+            const task = await taskRepository.findOne({ where: { id: taskId } });
+
+            if (!task) {
+                return;
+            }
+
+            // Переиспользуем код из команды task_info для формирования сообщения
+            const completedCount = await userTaskRepository.count({
+                where: {
+                    taskId,
+                    status: 'completed'
+                }
+            });
+
+            const pendingCount = await userTaskRepository.count({
+                where: {
+                    taskId,
+                    status: 'pending'
+                }
+            });
+
+            let message = `📋 *Детальная информация о задании*\n\n`;
+            message += `🆔 ID: ${task.id}\n`;
+            message += `🎯 Название: ${task.title}\n`;
+            message += `📝 Описание: ${task.description}\n\n`;
+
+            message += `💰 *Награда:* ${task.reward} ⭐\n`;
+            message += `📊 *Тип:* ${this.getTaskTypeName(task.type)}\n`;
+            message += `📈 *Статус:* ${task.status}\n`;
+            message += `👁️ *Доступно:* ${task.isAvailable ? 'Да' : 'Нет'}\n\n`;
+
+            if (task.channelUsername) {
+                message += `📢 *Канал:* ${task.channelUsername}\n`;
+            }
+            if (task.botUsername) {
+                message += `🤖 *Бот:* ${task.botUsername}\n`;
+            }
+            if (task.targetUrl) {
+                message += `🔗 *URL:* ${task.targetUrl}\n`;
+            }
+
+            message += `\n📊 *Статистика выполнения:*\n`;
+            message += `✅ Выполнено: ${completedCount} раз\n`;
+            message += `⏳ В ожидании: ${pendingCount}\n`;
+            message += `🎯 Всего выполнений: ${task.totalCompletions}\n`;
+            message += `🔢 Максимум: ${task.maxCompletions} раз на пользователя\n\n`;
+
+            if (task.expirationDate) {
+                const expiryDate = new Date(task.expirationDate);
+                message += `⏰ *Срок действия:* ${expiryDate.toLocaleDateString('ru-RU')}\n`;
+            } else {
+                message += `⏰ *Срок действия:* Бессрочно\n`;
+            }
+
+            message += `📅 *Создано:* ${task.createdAt.toLocaleDateString('ru-RU')}\n`;
+            message += `🔄 *Обновлено:* ${task.updatedAt.toLocaleDateString('ru-RU')}\n\n`;
+
+            message += `⚡ *Быстрые действия:*\n`;
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '👁️ Скрыть/показать', callback_data: `admin_toggle_${taskId}` },
+                        { text: '💰 Изменить награду', callback_data: `admin_reward_${taskId}` }
+                    ],
+                    [
+                        { text: '📊 Изменить статус', callback_data: `admin_status_${taskId}` },
+                        { text: '🗑️ Удалить', callback_data: `admin_delete_${taskId}` }
+                    ],
+                    [
+                        { text: '📋 Все задания', callback_data: 'admin_list_tasks' }
+                    ]
+                ]
+            };
+
+            // Обновляем оригинальное сообщение
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageText(message, {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Error updating task info message:', error);
+        }
     }
 
     public launch() {

@@ -40,6 +40,9 @@ const User_1 = require("../entities/User");
 const Withdrawal_1 = require("../entities/Withdrawal");
 const Game_1 = require("../entities/Game");
 const Captcha_1 = require("../entities/Captcha");
+const Task_1 = require("../entities/Task");
+const UserTask_1 = require("../entities/UserTask");
+const TaskClick_1 = require("../entities/TaskClick");
 dotenv.config();
 exports.AppDataSource = new typeorm_1.DataSource({
     type: 'postgres',
@@ -50,7 +53,13 @@ exports.AppDataSource = new typeorm_1.DataSource({
     database: process.env.DB_DATABASE || 'bot_star_db',
     synchronize: false,
     logging: process.env.NODE_ENV !== 'production',
-    entities: [User_1.User, Withdrawal_1.Withdrawal, Game_1.Game, Captcha_1.Captcha],
+    entities: [User_1.User,
+        Withdrawal_1.Withdrawal,
+        Game_1.Game,
+        Captcha_1.Captcha,
+        Task_1.Task, // добавляем
+        UserTask_1.UserTask, // добавляем  
+        TaskClick_1.TaskClick],
     migrations: ['dist/migrations/*.js'], // <- путь к скомпилированным JS
     subscribers: [],
 });
